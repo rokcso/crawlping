@@ -1,17 +1,40 @@
+# Default shape: reachable from this host only.
+#
+# The two addresses have different jobs, and mixing them up is the trap:
+#   listen: "0.0.0.0:8080"            binds every interface *inside* the container
+#   - "127.0.0.1:8080:8080"           publishes it on the host loopback only
+#
+# Docker's port forwarding delivers traffic to the container's eth0 address,
+# never to its loopback, so `listen: "127.0.0.1:8080"` inside a container is
+# unreachable even with `-p 8080:8080` - and it still reports healthy.
+# The "not reachable from other machines" part is the host-side `127.0.0.1`
+# in the ports mapping below, not the in-container listen address.
 services:
   crawlping:
     image: ghcr.io/rokcso/crawlping:latest
     restart: unless-stopped
-    # Loopback only. Put cloudflared in front instead of publishing the port:
-    #   cloudflared tunnel --url http://127.0.0.1:8080
-    network_mode: service:cloudflared
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config.yaml:/etc/crawlping/config.yaml:ro
 
-  # Optional: gives the API a public HTTPS name without opening a port.
-  # cloudflared:
-  #   image: cloudflare/cloudflared:latest
-  #   restart: unless-stopped
-  #   command: tunnel --no-autoupdate run
-  #   environment:
-  #     TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+# Alternative shape: no published port at all, reached over a Cloudflare
+# Tunnel. Replace the whole `services:` block above with the block below.
+# crawlping joins cloudflared's network namespace, so the tunnel's own
+# `http://127.0.0.1:8080` hits crawlping directly and the shipped
+# `listen: "127.0.0.1:8080"` is correct as-is.
+#
+# services:
+#   crawlping:
+#     image: ghcr.io/rokcso/crawlping:latest
+#     restart: unless-stopped
+#     network_mode: service:cloudflared
+#     volumes:
+#       - ./config.yaml:/etc/crawlping/config.yaml:ro
+#
+#   cloudflared:
+#     image: cloudflare/cloudflared:latest
+#     restart: unless-stopped
+#     command: tunnel --no-autoupdate run
+#     environment:
+#       TUNNEL_TOKEN: ${TUNNEL_TOKEN}

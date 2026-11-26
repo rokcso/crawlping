@@ -31,7 +31,8 @@ Workers/SSR site that signal is noisy in both directions.
 
 ## Install
 
-Three ways, same version:
+Three ways in. The binary and the container are built from the same Go
+version, and CI fails the tag if `go.mod` and the Dockerfile ever disagree.
 
 ```bash
 # Container (linux/amd64 and linux/arm64)
@@ -57,8 +58,16 @@ Generate a token, then write `config.yaml` (mode `0600`):
 openssl rand -hex 32
 ```
 
+Pick the shape you are deploying first, because it decides one line of that
+file: `listen:`. Everything below assumes the config is at `./config.yaml`.
+
+### Docker
+
+In a container the service must bind every interface; who may reach it is the
+host's decision, not the container's.
+
 ```yaml
-listen: "127.0.0.1:8080"
+listen: "0.0.0.0:8080"        # all interfaces *inside* the container
 
 sites:
   - host: example.com
@@ -69,16 +78,57 @@ sites:
 ```bash
 docker run -d --name crawlping \
   --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
   -v "$PWD/config.yaml:/etc/crawlping/config.yaml:ro" \
   ghcr.io/rokcso/crawlping
 ```
 
-The listener is loopback-only on purpose. Expose it with a Cloudflare Tunnel
-(`cloudflared tunnel --url http://127.0.0.1:8080`) or an SSH tunnel. Note that
-only the **inbound** path goes through Cloudflare - outbound to IndexNow still
+Both halves are required, and they do different jobs. `-p` forwards to the
+container's **eth0** address, never to its loopback, so a container left on the
+shipped `127.0.0.1:8080` is unreachable from the host even with
+`-p 8080:8080` - and it still reports healthy, because its health probe dials
+the same address the server is bound to. The `0.0.0.0` belongs to the container.
+"Not reachable from anywhere else" belongs to the host, and it is carried by the
+`127.0.0.1:` prefix in `-p 127.0.0.1:8080:8080`: the API answers on
+`http://127.0.0.1:8080` from this machine and from nowhere else. Write
+`-p 8080:8080` only if other machines really should reach it.
+
+`docker-compose.yaml` ships this shape:
+
+```bash
+docker compose up -d
+```
+
+### No Docker
+
+Run the binary directly and the shipped default is already correct - there is no
+container boundary to cross:
+
+```yaml
+listen: "127.0.0.1:8080"
+
+sites:
+  - host: example.com
+    indexnow_key: your-indexnow-key
+    token: the-token-you-generated
+```
+
+```bash
+crawlping serve -config config.yaml
+```
+
+### Behind a Cloudflare Tunnel
+
+Publish no port at all and let the tunnel carry inbound traffic: cloudflared
+reaches `http://127.0.0.1:8080`, so the shipped `listen: "127.0.0.1:8080"` is
+correct here too. The commented block in `docker-compose.yaml` is this shape.
+Only the **inbound** path goes through Cloudflare - outbound to IndexNow still
 leaves from your machine, which is the whole point.
 
-Check the key files are reachable before trusting it:
+### Check it before trusting it
+
+This reads the config and fetches every key URL; it does not care which shape
+you deployed:
 
 ```bash
 docker run --rm -v "$PWD/config.yaml:/etc/crawlping/config.yaml:ro" \

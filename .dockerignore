@@ -1,3 +1,9 @@
 .git
 *.md
-data
+# Local configuration carries real IndexNow keys and bearer tokens. It must
+# never enter the build context, where it would also land in the build-stage
+# layer cache.
+config.yaml
+data/
+dist/
+*.db

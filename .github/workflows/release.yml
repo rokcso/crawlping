@@ -1,19 +1,66 @@
 name: release
 
-# Tag-driven on purpose: pushing to main must not produce a version. A tag is
-# the only thing that should create a release.
+# Two triggers, two jobs, and they never overlap:
+#   push a v* tag         -> release only (this is the only thing that publishes)
+#   pull request / manual -> test only (nothing is published)
 on:
   push:
     tags:
       - "v*"
+  pull_request:
+  workflow_dispatch:
 
+# Read-only by default. Jobs that must write raise it themselves, so a step
+# added to the test job cannot acquire write access by accident.
 permissions:
-  contents: write # create the GitHub release
-  packages: write # push the image to GHCR
+  contents: read
 
 jobs:
-  release:
+  test:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The Dockerfile pins its own toolchain (`golang:X.Y-alpine`), so "one Go
+      # version" is only true while those two pins agree. A tag build that
+      # disagrees would ship binaries and an image on different compilers.
+      - name: Check Go version pins agree
+        run: |
+          set -euo pipefail
+          mod_version=$(awk '$1 == "go" { print $2 }' go.mod)
+          image_version=$(grep -oE 'golang:[0-9]+\.[0-9]+' Dockerfile | head -1 | cut -d: -f2)
+          mod_minor=$(echo "$mod_version" | cut -d. -f1,2)
+          image_minor=$(echo "$image_version" | cut -d. -f1,2)
+          echo "go.mod: $mod_version   Dockerfile: $image_version"
+          if [ -z "$image_version" ] || [ "$mod_minor" != "$image_minor" ]; then
+            echo "::error::go.mod ($mod_minor) and the Dockerfile toolchain ($image_minor) disagree"
+            exit 1
+          fi
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+          go vet ./...
+          go test ./...
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      packages: write # push the image to GHCR
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -37,6 +84,21 @@ jobs:
           go vet ./...
           go test ./...
 
+      # Same check as the test job: a tag can be pushed without a pull request,
+      # and the binaries and the image must come from the same Go version.
+      - name: Check Go version pins agree
+        run: |
+          set -euo pipefail
+          mod_version=$(awk '$1 == "go" { print $2 }' go.mod)
+          image_version=$(grep -oE 'golang:[0-9]+\.[0-9]+' Dockerfile | head -1 | cut -d: -f2)
+          mod_minor=$(echo "$mod_version" | cut -d. -f1,2)
+          image_minor=$(echo "$image_version" | cut -d. -f1,2)
+          echo "go.mod: $mod_version   Dockerfile: $image_version"
+          if [ -z "$image_version" ] || [ "$mod_minor" != "$image_minor" ]; then
+            echo "::error::go.mod ($mod_minor) and the Dockerfile toolchain ($image_minor) disagree"
+            exit 1
+          fi
+
       - name: Resolve version
         id: version
         run: |
@@ -52,7 +114,8 @@ jobs:
 
       # Cross-compiled here rather than in the Dockerfile: the image is
       # multi-arch, but people who run without Docker want a plain binary, and
-      # producing both from one Go toolchain keeps them at the same version.
+      # producing both from one Go toolchain keeps them at the same version
+      # (the step above is what keeps that claim true).
       - name: Build binaries
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -83,6 +146,10 @@ jobs:
           (cd dist && sha256sum ./* > checksums.txt)
           ls -l dist
 
+      # No longer required for the compile: the Dockerfile builds on
+      # $BUILDPLATFORM and cross-compiles, so Go never runs under emulation.
+      # Kept as insurance for the final stage and for any future non-native
+      # step; it costs seconds.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
@@ -118,12 +185,20 @@ jobs:
             "${tags[@]}" \
             --push .
 
+      # Idempotent on purpose. The image push above can succeed and this step
+      # still fail (network, rate limit), and a re-run must not stop at
+      # "release already exists" with the artifacts never attached.
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRERELEASE: ${{ steps.version.outputs.prerelease }}
         run: |
           set -euo pipefail
-          flags=(--generate-notes)
-          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
-          gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; replacing assets"
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            flags=(--generate-notes)
+            [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+            gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
+          fi

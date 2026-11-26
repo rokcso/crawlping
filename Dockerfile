@@ -1,15 +1,23 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.24-alpine AS build
+# Build on the machine's own architecture and cross-compile from there.
+# Without --platform=$BUILDPLATFORM, an arm64 image compiles every file under
+# QEMU: same output, many times the wall clock, and no benefit.
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
 
 ARG VERSION=dev
+# BuildKit fills these in from the platform being built: the host's own for a
+# plain `docker build`, each entry of --platform for buildx. Only the legacy
+# builder leaves them empty, where Go falls back to its own defaults.
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/crawlping .
 
