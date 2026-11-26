@@ -1,0 +1,19 @@
+# The listener is loopback by default: put cloudflared (or any reverse proxy)
+# in front of it instead of publishing the port. Reach it remotely with
+#   ssh -N -L 8080:127.0.0.1:8080 user@vps
+# or point a Cloudflare Tunnel at http://127.0.0.1:8080.
+listen: "127.0.0.1:8080"
+
+# One entry per origin you submit for. Generate a token with:
+#   openssl rand -hex 32
+sites:
+  - host: example.com
+    # Also the name of the key file served at https://example.com/<key>.txt
+    indexnow_key: replace-with-your-indexnow-key
+    # Optional: set only when the key file lives somewhere other than the root.
+    # key_location: https://example.com/some/path/key.txt
+    token: change-me-to-a-hex-string-at-least-16-chars
+
+  # - host: second-site.com
+  #   indexnow_key: another-key
+  #   token: another-token
