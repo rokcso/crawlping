@@ -1,0 +1,17 @@
+services:
+  crawlping:
+    image: ghcr.io/rokcso/crawlping:latest
+    restart: unless-stopped
+    # Loopback only. Put cloudflared in front instead of publishing the port:
+    #   cloudflared tunnel --url http://127.0.0.1:8080
+    network_mode: service:cloudflared
+    volumes:
+      - ./config.yaml:/etc/crawlping/config.yaml:ro
+
+  # Optional: gives the API a public HTTPS name without opening a port.
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run
+  #   environment:
+  #     TUNNEL_TOKEN: ${TUNNEL_TOKEN}
