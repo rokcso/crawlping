@@ -46,33 +46,28 @@ docker pull ghcr.io/rokcso/crawlping:latest
 go install github.com/rokcso/crawlping@latest
 ```
 
-> **GHCR packages are private by default.** Until the package is switched to
-> public in its GitHub settings, `docker pull` returns 401. The image exists,
-> but only the account that pushed it can read it.
+The image is public: `docker pull` needs no `docker login`.
 
 ## Quick start
 
-Generate a token, then write `config.yaml` (mode `0600`):
+Generate a token and copy the example config (mode `0600` - it holds tokens):
 
 ```bash
 openssl rand -hex 32
+cp config.example.yaml config.yaml
+chmod 600 config.yaml
 ```
 
-Pick the shape you are deploying first, because it decides one line of that
-file: `listen:`. Everything below assumes the config is at `./config.yaml`.
+Which shape you deploy decides one line of that file - `listen:`. Everything
+below assumes the config is at `./config.yaml`.
 
 ### Docker
 
-In a container the service must bind every interface; who may reach it is the
-host's decision, not the container's.
+`config.example.yaml` ships this shape, so copying it and filling in the host,
+key and token is the whole configuration step:
 
 ```yaml
 listen: "0.0.0.0:8080"        # all interfaces *inside* the container
-
-sites:
-  - host: example.com
-    indexnow_key: your-indexnow-key      # also served at /<key>.txt
-    token: the-token-you-generated
 ```
 
 ```bash
@@ -84,8 +79,8 @@ docker run -d --name crawlping \
 ```
 
 Both halves are required, and they do different jobs. `-p` forwards to the
-container's **eth0** address, never to its loopback, so a container left on the
-shipped `127.0.0.1:8080` is unreachable from the host even with
+container's **eth0** address, never to its loopback, so a container left on
+`127.0.0.1:8080` is unreachable from the host even with
 `-p 8080:8080` - and it still reports healthy, because its health probe dials
 the same address the server is bound to. The `0.0.0.0` belongs to the container.
 "Not reachable from anywhere else" belongs to the host, and it is carried by the
@@ -93,7 +88,8 @@ the same address the server is bound to. The `0.0.0.0` belongs to the container.
 `http://127.0.0.1:8080` from this machine and from nowhere else. Write
 `-p 8080:8080` only if other machines really should reach it.
 
-`docker-compose.yaml` ships this shape:
+`docker-compose.yaml` publishes this shape on `127.0.0.1` only, so this reaches
+it from this machine and from nowhere else:
 
 ```bash
 docker compose up -d
@@ -101,16 +97,12 @@ docker compose up -d
 
 ### No Docker
 
-Run the binary directly and the shipped default is already correct - there is no
-container boundary to cross:
+Run the binary directly and switch that line to loopback. The example ships the
+container shape, and with no container there is no port forwarding to satisfy,
+so only this machine should be able to reach it:
 
 ```yaml
 listen: "127.0.0.1:8080"
-
-sites:
-  - host: example.com
-    indexnow_key: your-indexnow-key
-    token: the-token-you-generated
 ```
 
 ```bash
@@ -119,9 +111,10 @@ crawlping serve -config config.yaml
 
 ### Behind a Cloudflare Tunnel
 
-Publish no port at all and let the tunnel carry inbound traffic: cloudflared
-reaches `http://127.0.0.1:8080`, so the shipped `listen: "127.0.0.1:8080"` is
-correct here too. The commented block in `docker-compose.yaml` is this shape.
+Publish no port at all and let the tunnel carry inbound traffic. crawlping joins
+cloudflared's network namespace, so cloudflared's `http://127.0.0.1:8080` is
+crawlping's own loopback: switch that line back to `127.0.0.1:8080`, and no port
+is published. The commented block in `docker-compose.yaml` is this shape.
 Only the **inbound** path goes through Cloudflare - outbound to IndexNow still
 leaves from your machine, which is the whole point.
 

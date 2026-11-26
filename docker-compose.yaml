@@ -9,6 +9,9 @@
 # unreachable even with `-p 8080:8080` - and it still reports healthy.
 # The "not reachable from other machines" part is the host-side `127.0.0.1`
 # in the ports mapping below, not the in-container listen address.
+#
+# config.example.yaml ships this shape, so `cp config.example.yaml config.yaml`
+# then `docker compose up -d` is a working install with nothing else to change.
 services:
   crawlping:
     image: ghcr.io/rokcso/crawlping:latest
@@ -19,10 +22,10 @@ services:
       - ./config.yaml:/etc/crawlping/config.yaml:ro
 
 # Alternative shape: no published port at all, reached over a Cloudflare
-# Tunnel. Replace the whole `services:` block above with the block below.
+# Tunnel. Replace the whole `services:` block above with the block below and
+# change the config's `listen:` back to `127.0.0.1:8080`.
 # crawlping joins cloudflared's network namespace, so the tunnel's own
-# `http://127.0.0.1:8080` hits crawlping directly and the shipped
-# `listen: "127.0.0.1:8080"` is correct as-is.
+# `http://127.0.0.1:8080` is crawlping's loopback, with no port published.
 #
 # services:
 #   crawlping:

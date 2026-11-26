@@ -1,13 +1,18 @@
-# The listener is loopback by default: put cloudflared (or any reverse proxy)
-# in front of it instead of publishing the port. Reach it remotely with
-#   ssh -N -L 8080:127.0.0.1:8080 user@vps
-# or point a Cloudflare Tunnel at http://127.0.0.1:8080.
-listen: "127.0.0.1:8080"
+# This address belongs to the container, so it binds every interface inside the
+# container. Docker forwards published ports to eth0, never to the container's
+# loopback, so 127.0.0.1:8080 here is unreachable from the host even while the
+# container reports healthy. "Reachable from this machine only" is the host-side
+# `-p 127.0.0.1:8080:8080` in docker-compose.yaml, not this line.
+#
+# Running the binary directly, with no container? Change it to "127.0.0.1:8080".
+# Same for a Cloudflare Tunnel, where cloudflared shares this network namespace.
+listen: "0.0.0.0:8080"
 
 # One entry per origin you submit for. Generate a token with:
 #   openssl rand -hex 32
 sites:
   - host: example.com
+    # A non-ASCII (IDN) host must be punycode: Unicode labels are refused, and a Unicode URL here is foreign.
     # Also the name of the key file served at https://example.com/<key>.txt
     indexnow_key: replace-with-your-indexnow-key
     # Optional: set only when the key file lives somewhere other than the root.
