@@ -61,6 +61,12 @@ chmod 600 config.yaml
 Which shape you deploy decides one line of that file - `listen:`. Everything
 below assumes the config is at `./config.yaml`.
 
+The other key worth knowing is `indexnow_endpoint`. It defaults to the global
+`https://api.indexnow.org/indexnow`, and leaving it alone is right for almost
+everyone: that endpoint shares the submission with every participating engine,
+so one POST already reaches all of them. Set it only to target a single engine
+instead; `config.example.yaml` lists the documented per-engine endpoints.
+
 ### Docker
 
 `config.example.yaml` ships this shape, so copying it and filling in the host,
@@ -146,6 +152,16 @@ can tell a wrong key from an origin that did not answer:
 ```
 crawlping: 1 of 3 key files failed, 1 could not be checked
 ```
+
+A green `check` is a local vantage point, not the engine's verdict. This command
+fetches each key file from the machine crawlping runs on; the engines fetch it
+themselves, from their own addresses, at submission time, and IndexNow has no
+verification API to ask in advance. A key file can pass `check` and `/health`
+and still be refused on the first real submission. A `403` after a green
+`check` therefore usually means the engine's fetcher is being blocked - a bot
+filter, or a country rule in front of the file - rather than the key being
+wrong, which is a live concern on Cloudflare. The only authoritative
+confirmation is the engine's own `200` or `202` on a real submission.
 
 ## API
 
@@ -439,6 +455,10 @@ if (res.status === 429 || res.status === 503) {
 ## What it deliberately does not do
 
 - No sitemap watching or diffing. You send the URLs you changed.
+- No look at the target page. Nothing here fetches a submitted URL, so
+crawlping cannot know that one is `noindex`, blocked by `robots.txt`, or already
+`404`. Every submitted URL spends crawl quota, indexed or not, so that judgement
+stays with the caller.
 - No retry loop. `429`, `502` and `503` are reported so your code can decide;
 the instance only bounds how much it will spend on your behalf.
 - No per-URL memory and no resubmission debounce. Only a single request is
@@ -447,8 +467,10 @@ the instance only bounds how much it will spend on your behalf.
 - No database, no UI, no accounts.
 - No Google. Google's Indexing API accepts only `JobPosting` and
   `BroadcastEvent`, so no tool can submit ordinary pages to Google.
-- No multi-channel submission yet. Bing Webmaster API and Yandex are the
-  obvious next adapters, which is why the reason/status surface is explicit.
+- No Bing Webmaster or Yandex webmaster API. Those are separate products, not
+  more IndexNow endpoints: a submission to the global endpoint is already shared
+  with every participating engine. What the webmaster APIs add is submission
+  quota and index status, which IndexNow does not expose.
 
 ## Development
 

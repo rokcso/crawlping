@@ -8,6 +8,20 @@
 # Same for a Cloudflare Tunnel, where cloudflared shares this network namespace.
 listen: "0.0.0.0:8080"
 
+# Optional: which IndexNow endpoint to submit to. The default is the global one,
+# and leaving it alone is right for almost everyone: a submission there is
+# shared with every participating engine, so there is nothing to fan out
+# yourself. Set it only to target a single engine instead. The documented
+# endpoints are:
+#   https://api.indexnow.org/indexnow       global, the default
+#   https://www.bing.com/indexnow
+#   https://yandex.com/indexnow
+#   https://search.seznam.cz/indexnow
+#   https://searchadvisor.naver.com/indexnow
+#   https://indexnow.yep.com/indexnow
+#   https://indexnow.amazonbot.amazon/indexnow
+# indexnow_endpoint: https://api.indexnow.org/indexnow
+
 # One entry per origin you submit for. Generate a token with:
 #   openssl rand -hex 32
 sites:
