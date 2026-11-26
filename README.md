@@ -130,6 +130,21 @@ docker run --rm -v "$PWD/config.yaml:/etc/crawlping/config.yaml:ro" \
 
 ```
 ok    example.com                      https://example.com/your-indexnow-key.txt
+FAIL  shop.example.org                 https://shop.example.org/key.txt
+      key file rejected: key file does not match indexnow_key
+????  blog.example.net                 https://blog.example.net/key.txt
+      could not determine: key file unreachable: fetch key file: context deadline exceeded
+```
+
+It prints one line per site, and the three prefixes are the three key states
+`/health` reports. `FAIL` means the file was fetched and refused, which is
+`failed`. `????` means the file was never read - the origin was down, slow, or
+the name did not resolve - so nothing is known about that key, and it is not
+counted as a broken one. The exit status keeps the two apart, so a deploy script
+can tell a wrong key from an origin that did not answer:
+
+```
+crawlping: 1 of 3 key files failed, 1 could not be checked
 ```
 
 ## API
@@ -160,9 +175,15 @@ Every entry has to look like this, or the whole batch is refused:
   a document rather than a second URL
 - duplicates collapse, so the same URL twice is one submission
 
-The body is capped at 64 KiB. A body larger than that is answered with
-`413 payload_too_large` and a detail naming the limit, not with a syntax error:
-valid JSON that is simply too big is not malformed JSON.
+The body is capped at 65536 bytes (64 KiB), and the cap counts the bytes that
+were actually sent rather than the bytes a JSON decoder happened to stop at: a
+small object followed by megabytes of filler is answered with
+`413 payload_too_large` and a detail naming the limit, not with a syntax error,
+because valid JSON that is simply too big is not malformed JSON. A body with
+anything after the JSON value - a second object, a stray brace, trailing text -
+is answered with `400 bad_request` instead of having the extra bytes silently
+ignored. Together they describe the one shape the endpoint accepts: a single
+`{"urls": [...]}` object, then the end of the body.
 
 ```json
 {"ok": true, "status": 200, "host": "example.com", "submitted": 2}
@@ -177,23 +198,73 @@ as `engine_status`, and only when an engine actually answered.
 ### `GET /health`
 
 ```json
-{"ok": true, "sites": 1, "keys": {"example.com": true}}
+{"ok": true, "sites": 1, "verified": 1, "failed": 0, "pending": 0}
 ```
 
-`keys` reports the key-file check. The check runs **after** the listener is up
-and in the background, so a slow or unreachable origin cannot delay the first
-byte. A host appears in `keys` only once its check has an answer, so both `true`
-and `false` are results. While a check is still running its host is listed in
-`pending` instead of being reported as broken:
+That is the whole shape: counts, and no host name, key, key location or URL. The
+parameterless endpoint is reachable by anything that can reach the port, and the
+Cloudflare Tunnel shape above makes that the whole internet, so an anonymous GET
+must not be able to enumerate which domains this instance submits for, nor learn
+which of them are ready.
+
+The three counters are the key states below and always add up to `sites`: every
+configured host is counted exactly once, and a host nothing is known about yet is
+`pending`, not `failed`.
+
+The status code answers one question - is the process up - so it stays `200` even
+when `failed` is non-zero. A key file that does not work is the origin's problem
+to fix, restarting this container would not change it, and a probe that restarts
+on a stale key turns a wrong key file into an outage.
+
+#### `GET /health?detail=1`
+
+The per-host view is behind a site token, the same bearer token `/submit` takes:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/health?detail=1
+```
 
 ```json
-{"ok": true, "sites": 1, "keys": {}, "pending": ["example.com"]}
+{"ok": true, "sites": 2, "keys": {"example.com": "verified", "shop.example.org": "pending"}}
 ```
 
-A stale key file does not fail the health check, because restarting the
-container would not fix an origin that is down. A host marked `false` also
-recovers by itself: the next accepted submission sets it back to `true`, so a
-key file fixed at the origin does not need a restart.
+A missing, empty, wrong or unknown token is refused before a single host name is
+written, so a failed guess learns nothing:
+
+```json
+{"ok": false, "status": 401, "reason": "unknown_token"}
+```
+
+`detail` counts as soon as the parameter is present, so `?detail`, `?detail=1`
+and `?detail=yes` all ask for the per-host view. Only `?detail=0` and
+`?detail=false` switch it off, so a typo fails towards the answer that was asked
+for rather than away from it.
+
+### Key states
+
+Every host is in exactly one of three states. Two of them are facts about the key
+and one is the absence of a fact, which is why there are not two.
+
+| State | What it means | What sets it |
+|---|---|---|
+| `verified` | the key is known to work | the key file was fetched and matched, or a submission was accepted with engine `200` |
+| `pending` | nothing is known yet | not checked yet, a check still running, a check cancelled or timed out, an unreachable origin, or the engine answered `202` ("received, key validation pending") |
+| `failed` | the key is known not to work | the key file was fetched and definitively rejected (non-2xx status, unreadable body, or body mismatch), or the engine answered `403` |
+
+The distinction that matters: cancellation and an unreachable origin are **not**
+failures. A check that reached no answer learned nothing, so it records `pending`
+- or leaves the state alone when the process is shutting down - instead of
+blaming a key file nobody managed to read. Only a definitive rejection is
+`failed`.
+
+An engine error or a rate limit says nothing about the key and leaves the state
+as it was. A host that is `failed` recovers by itself: the next accepted
+submission with engine `200` sets it back to `verified`, so a key file fixed at
+the origin does not need a restart.
+
+The check runs **after** the listener is up and in the background, so slow or
+unreachable origins cannot delay the first byte, and no outcome here stops the
+process.
 
 ## Result mapping
 
@@ -202,15 +273,15 @@ Your caller decides whether to retry.
 
 | HTTP | `reason` | Meaning | Retry? |
 |---|---|---|---|
-| 200 | - | accepted (200 or 202 from IndexNow) | no |
-| 400 | `bad_request` | malformed JSON body, or nothing usable once the URLs were cleaned | no |
+| 200 | - | accepted (200 or 202 from IndexNow; a 202 leaves the key `pending`) | no |
+| 400 | `bad_request` | the JSON did not parse, or did not end where the object ended (trailing data), or the body could not be read, or nothing usable survived URL cleaning, or the engine answered 400 | no |
 | 400 | `invalid_url` | an entry is empty, or not an absolute http/https URL | no - fix the caller |
 | 400 | `too_many` | more than 100 URLs in one request | no - split the batch |
 | 400 | `non_default_port` | an entry names a port IndexNow will not accept | no - fix the caller |
 | 400 | `engine_rejected` | the engine refused this payload with a status that has no retry rule | no - resending it is pointless |
-| 401 | `unknown_token` | missing or unknown bearer token | no |
-| 403 | `key_rejected` | the engine did not accept the key file | no - fix the key |
-| 413 | `payload_too_large` | the body was larger than the 64 KiB limit | no - send fewer URLs |
+| 401 | `unknown_token` | missing or unknown bearer token, on `/submit` or `/health?detail=1` | no |
+| 403 | `key_rejected` | the engine did not accept the key file; also marks the host `failed` | no - fix the key |
+| 413 | `payload_too_large` | the body was larger than the 65536 byte limit | no - send fewer URLs |
 | 422 | `host_mismatch` | a URL was not on the site's own host | no - fix the caller |
 | 429 | `rate_limited` | engine is throttling; see `Retry-After` | yes, later |
 | 502 | `engine_error` | engine 5xx or the request never landed | yes, later |
