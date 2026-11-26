@@ -18,6 +18,19 @@ RUN CGO_ENABLED=0 go build -trimpath \
 # nonroot user and a healthcheck-friendly layout.
 FROM gcr.io/distroless/static-debian12:nonroot
 
+# Redeclared because a build arg does not cross stages. The version label is
+# what makes `docker inspect` answer "which build is this".
+ARG VERSION=dev
+
+# The source label is not decoration: a package linked to its repository at
+# publish time inherits the repository's permissions. Adding it later means
+# linking by hand in the package settings.
+LABEL org.opencontainers.image.title="crawlping" \
+      org.opencontainers.image.description="Submit URLs to IndexNow from a machine you control" \
+      org.opencontainers.image.source="https://github.com/rokcso/crawlping" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
+
 COPY --from=build /out/crawlping /crawlping
 
 EXPOSE 8080

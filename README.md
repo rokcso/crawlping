@@ -194,3 +194,7 @@ not move `latest`.
 What the workflow deliberately does not do: no goreleaser, no cosign, no SBOM.
 At this size those are ceremony rather than protection - the build is
 `go build` and the artifact is reproducible from the tag.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
