@@ -169,11 +169,37 @@ Every entry has to look like this, or the whole batch is refused:
   not absolute URLs)
 - on the site's own host: a lookalike such as `example.com.evil.test` counts as
   a foreign host
-- on the default port only, `443` for https and `80` for http
-- at most 100 URLs per request, counted after cleaning
+- on the default port only, `443` for https and `80` for http - this instance's
+  rule, not IndexNow's, for the reason below
+- at most 100 URLs per request, counted after cleaning (IndexNow allows 10,000
+  per POST; the smaller cap is this instance's own restraint)
+- within the directory the key file covers, when the key file is not at the
+  host root
 - a fragment is stripped before sending, because `#section` marks a place inside
   a document rather than a second URL
 - duplicates collapse, so the same URL twice is one submission
+
+Where the key file sits decides what the key covers. `key_location` defaults to
+the host root, and a key file there covers the whole host. One inside a
+directory, such as `https://example.com/catalog/<key>.txt`, covers only URLs
+under that directory: `/catalog/a` is in scope, `/help/b` and the site root are
+not. A URL outside that scope is refused locally as `out_of_key_scope` and
+nothing is sent to the engine, so the fix is to move the key file to the root or
+to stop submitting URLs outside its directory.
+
+The default-port rule on that list is this instance's, not the protocol's.
+IndexNow sets no port requirement - not in the specification, not in the FAQ,
+not in the Bing documentation - and the usual client practice is to strip a
+default port while normalising a URL rather than to reject one. crawlping still
+refuses a non-default port, because one unacceptable URL can poison a whole
+batch: the engine refuses the entire POST, so a caller who sends 99 good URLs
+and one on `:8080` learns nothing about any of them.
+
+A URL that now redirects, and a URL whose page now answers `404` or `410`, are
+exactly the URLs worth submitting. IndexNow asks for them, because that is how
+an engine learns to move or drop an entry it already has. crawlping treats them
+as ordinary URLs on the host - nothing here fetches a URL or checks that it is
+alive - so removing a page is a submission, not an omission.
 
 The body is capped at 65536 bytes (64 KiB), and the cap counts the bytes that
 were actually sent rather than the bytes a JSON decoder happened to stop at: a
@@ -217,6 +243,18 @@ They exist to keep a leaked token or a retry loop in one caller from pushing the
 operator's IP into the engine's throttle - which would break the legitimate
 submissions too, and is the exact harm this tool exists to avoid. A refused
 request is answered locally and never reaches the engine.
+
+These bounds are about how fast this instance spends its own egress IP. They say
+nothing about whether a URL has already been sent, and they will not stop you
+submitting one again. crawlping keeps no per-URL state: no history, no debounce,
+no record that a URL was sent before. Deduplication across requests and the
+resubmission interval are the caller's job, and IndexNow is explicit about both:
+do not resubmit a URL that has not changed, wait at least 5 minutes before
+resubmitting the same URL (10 in another part of the same documentation), and
+assume every submitted URL spends crawl quota whether or not the engine already
+had it. The only deduplication inside crawlping is within a single request,
+where duplicates collapse before sending. A `200` means the batch was received;
+resubmitting on a timer is not a faster route to being crawled.
 
 There are two different `429`s and they are worth telling apart:
 
@@ -344,7 +382,8 @@ Your caller decides whether to retry.
 | 400 | `bad_request` | the JSON did not parse, or did not end where the object ended (trailing data), or the body could not be read, or nothing usable survived URL cleaning, or the engine answered 400 | no |
 | 400 | `invalid_url` | an entry is empty, or not an absolute http/https URL | no - fix the caller |
 | 400 | `too_many` | more than 100 URLs in one request | no - split the batch |
-| 400 | `non_default_port` | an entry names a port IndexNow will not accept | no - fix the caller |
+| 400 | `non_default_port` | an entry names a port this instance will not send; IndexNow itself sets no port requirement | no - fix the caller |
+| 400 | `out_of_key_scope` | a URL is outside the directory the key file covers | no - move the key file or stop submitting URLs outside its directory |
 | 400 | `engine_rejected` | the engine refused this payload with a status that has no retry rule | no - resending it is pointless |
 | 401 | `unknown_token` | missing or unknown bearer token, on `/submit` or `/health?detail=1` | no |
 | 403 | `key_rejected` | the engine did not accept the key file; also marks the host `failed` | no - fix the key |
@@ -402,6 +441,9 @@ if (res.status === 429 || res.status === 503) {
 - No sitemap watching or diffing. You send the URLs you changed.
 - No retry loop. `429`, `502` and `503` are reported so your code can decide;
 the instance only bounds how much it will spend on your behalf.
+- No per-URL memory and no resubmission debounce. Only a single request is
+  deduplicated, so the interval between submissions of the same URL is yours to
+  enforce.
 - No database, no UI, no accounts.
 - No Google. Google's Indexing API accepts only `JobPosting` and
   `BroadcastEvent`, so no tool can submit ordinary pages to Google.
