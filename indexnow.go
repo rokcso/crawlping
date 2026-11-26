@@ -46,8 +46,24 @@ const (
 const maxURLsPerRequest = 100
 
 // maxEngineDetailBytes bounds how much of an engine error body reaches a log
-// line or an API response.
+// line or an API response. It is deliberately small, which means a body larger
+// than this is abandoned mid-stream and its connection cannot be reused;
+// draining a whole engine error page just to keep one connection alive is not
+// worth the allocation.
 const maxEngineDetailBytes = 512
+
+// Why a key-file check reached no answer, separated from the check reaching a
+// bad answer. Only the second is evidence that the key is broken: an origin
+// that is down, and a key file that is wrong, need different things from the
+// operator and must not be reported as the same result.
+var (
+	// errKeyFileUnreachable means the key file was never read, so nothing is
+	// known about the key.
+	errKeyFileUnreachable = errors.New("key file unreachable")
+	// errKeyFileRejected means the key file was read and does not reproduce the
+	// configured key.
+	errKeyFileRejected = errors.New("key file rejected")
+)
 
 // Refusals filterURLs can return. Each one is a request problem, so the caller
 // gets a 4xx and an error that names the entry that caused it. They are
@@ -82,6 +98,32 @@ func (r submissionResult) accepted() bool {
 	return r.Reason == reasonAccepted
 }
 
+// keyStateAfter reports what a submission proves about the site's key. An empty
+// state means it proves nothing, so the recorded state must be left alone: an
+// engine error or a rate limit is not evidence that anything is wrong with the
+// key file. An accepted batch proves a working key only when the engine answered
+// 200; 202 says the batch was received and key validation is still pending, so
+// it records "unknown" rather than claiming the key works.
+func (r submissionResult) keyStateAfter() keyState {
+	if r.accepted() {
+		switch r.EngineStatus {
+		case http.StatusOK:
+			return keyStateVerified
+		case http.StatusAccepted:
+			return keyStatePending
+		}
+
+		return ""
+	}
+
+	// The engine fetched the key file itself and refused it.
+	if r.Reason == reasonKeyRejected {
+		return keyStateFailed
+	}
+
+	return ""
+}
+
 type indexNowClient struct {
 	endpoint string
 	http     *http.Client
@@ -95,34 +137,57 @@ func newIndexNowClient(endpoint string) *indexNowClient {
 }
 
 // verifyKey fetches the key file the engine will fetch. A mismatch here means
-// every submission will come back 403, so it is worth failing loudly at
-// startup rather than silently per request.
+// every submission will come back 403, so it is worth reporting rather than
+// discovering per request. Every error says which of the two things happened:
+// the file was read and is wrong, or it was never read at all.
 func (c *indexNowClient) verifyKey(ctx context.Context, site Site) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, site.KeyLocation, nil)
 	if err != nil {
-		return fmt.Errorf("build key request: %w", err)
+		return fmt.Errorf("%w: build key request: %w", errKeyFileUnreachable, err)
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("fetch key file: %w", err)
+		// Includes a cancelled or timed-out check: no key file was read.
+		return fmt.Errorf("%w: fetch key file: %w", errKeyFileUnreachable, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("key file returned %d", resp.StatusCode)
+		return fmt.Errorf("%w: key file returned %d", errKeyFileRejected, resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if err != nil {
-		return fmt.Errorf("read key file: %w", err)
+		return fmt.Errorf("%w: read key file: %w", errKeyFileRejected, err)
 	}
 
 	if strings.TrimSpace(string(body)) != site.IndexNowKey {
-		return fmt.Errorf("key file does not match indexnow_key")
+		return fmt.Errorf("%w: key file does not match indexnow_key", errKeyFileRejected)
 	}
 
 	return nil
+}
+
+// keyStateAfterCheck maps a finished key check to the state it proves. An empty
+// state means the check never reached an answer and the recorded state must be
+// left alone: shutdown cancelling the check is not a faulty key file, and
+// reporting it as one is what used to mark every remaining site failed - at
+// ERROR level - on SIGTERM.
+func keyStateAfterCheck(err error) keyState {
+	switch {
+	case err == nil:
+		return keyStateVerified
+	case errors.Is(err, context.Canceled):
+		return ""
+	case errors.Is(err, errKeyFileRejected):
+		return keyStateFailed
+	default:
+		// A deadline, a refused connection, or a name that does not resolve:
+		// the key file was never read, so we do not know. Not knowing is
+		// pending, not failed.
+		return keyStatePending
+	}
 }
 
 // submit posts the batch and translates the engine's status into a reason.
@@ -186,8 +251,9 @@ func (c *indexNowClient) submit(ctx context.Context, site Site, urls []string) s
 	}
 
 	// Read a bounded prefix whatever the status is: it is the only place the
-	// engine explains a refusal, and reading it lets the connection be reused
-	// instead of being closed mid-body.
+	// engine explains a refusal. A body larger than maxEngineDetailBytes is
+	// abandoned mid-stream, so that connection is not reused; the cap is worth
+	// more than the connection, since the detail is a log line.
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxEngineDetailBytes))
 	if !result.accepted() {
 		result.Detail = summarizeEngineBody(body)
@@ -254,9 +320,11 @@ func filterURLs(host string, urls []string) (clean []string, err error) {
 }
 
 // canonicalHost folds the two things that are not part of a host's identity:
-// its case and the trailing dot of an absolute DNS name. This is the comparison
-// form only; config.normalizeHost is the validating one, and a config value has
-// already been through it by the time a request is served.
+// its case and the trailing dot of an absolute DNS name. Both sides of the
+// comparison go through it, so a configured "Example.com." still matches
+// https://example.com/... This is the comparison form only; config's
+// normalizeHost is the validating one, and a configured host has already been
+// through it before a request is served.
 func canonicalHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 }

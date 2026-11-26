@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,11 +19,42 @@ import (
 // larger is a mistake or an attempt to make the process allocate.
 const maxBodyBytes = 64 << 10
 
+// verifyTimeout bounds one key-file check, so a slow origin cannot hold the
+// background check open indefinitely.
+const verifyTimeout = 10 * time.Second
+
 // reasonPayloadTooLarge is the only reason the handler produces on its own. It
 // lives here rather than with the engine reasons because an oversized body is
 // refused before a submission is built: no engine ever saw the payload, so
 // calling it a malformed one would send the caller looking at their syntax.
 const reasonPayloadTooLarge = "payload_too_large"
+
+// reasonUnknownToken is the single refusal reason for a missing or unrecognised
+// bearer token, on every endpoint that takes one.
+const reasonUnknownToken = "unknown_token"
+
+// keyState is everything this service can honestly say about a host's key file.
+// There are three states rather than two because a check that reached no answer
+// is not a failed check: an origin that is down, a check cut short by shutdown,
+// and a key file that is definitely wrong are different facts, and only the last
+// one is anybody's fault to fix.
+type keyState string
+
+const (
+	// keyStateVerified means the key is known to work: the key file was fetched
+	// and matched, or the engine accepted a batch with 200, which is the status
+	// IndexNow returns once it has validated the key.
+	keyStateVerified keyState = "verified"
+	// keyStatePending means nothing is known: the host has not been checked
+	// yet, a check is still running, the check was cancelled or timed out, or
+	// the engine answered 202, which only says the batch was received and key
+	// validation is still pending. It is never reported as verified or failed.
+	keyStatePending keyState = "pending"
+	// keyStateFailed means the key is known not to work: the key file was
+	// fetched and refused (non-2xx status, unreadable body, or a body that is
+	// not the configured key), or the engine answered 403.
+	keyStateFailed keyState = "failed"
+)
 
 type server struct {
 	cfg    *Config
@@ -31,20 +62,18 @@ type server struct {
 	log    *slog.Logger
 
 	mu sync.RWMutex
-	// verified remembers the last key-file check per host, so /health can say
-	// whether submissions are currently expected to work. A host missing from
-	// the map has not been checked yet, which is not the same as checked and
-	// failed; setVerified is the only writer, and a successful submission sets
-	// it back to true so a fixed key file recovers without a restart.
-	verified map[string]bool
+	// keyStates holds the last recorded state per host. A host that is absent
+	// is pending, which is the honest default and the reason the map only ever
+	// grows: setKeyState is the only writer.
+	keyStates map[string]keyState
 }
 
 func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
 	return &server{
-		cfg:      cfg,
-		client:   client,
-		log:      log,
-		verified: make(map[string]bool, len(cfg.Sites)),
+		cfg:       cfg,
+		client:    client,
+		log:       log,
+		keyStates: make(map[string]keyState, len(cfg.Sites)),
 	}
 }
 
@@ -82,25 +111,31 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	if token == "" {
 		writeJSON(w, http.StatusUnauthorized, submitResponse{
 			Status: http.StatusUnauthorized,
-			Reason: "unknown_token",
+			Reason: reasonUnknownToken,
 		})
 		return
 	}
 
 	site := s.siteForToken(token)
 	if site == nil {
-		s.log.Warn("submit rejected", "reason", "unknown_token", "remote", r.RemoteAddr)
+		s.log.Warn("submit rejected", "reason", reasonUnknownToken, "remote", r.RemoteAddr)
 		writeJSON(w, http.StatusUnauthorized, submitResponse{
 			Status: http.StatusUnauthorized,
-			Reason: "unknown_token",
+			Reason: reasonUnknownToken,
 		})
 		return
 	}
 
+	// The cap is enforced by reading the body, not by the decoder. A decoder
+	// stops at the end of the first JSON value, so a small value followed by
+	// an enormous amount of trailing bytes never reaches the limit, and
+	// MaxBytesReader has nothing to refuse. Reading all of it applies the cap
+	// to the bytes that were actually sent, and json.Unmarshal then rejects
+	// anything left over after the value.
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
-	var request submitRequest
-	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
 		// An oversized body is not a malformed one: it can be perfectly valid
 		// JSON that simply does not fit, so it gets its own status and reason
 		// instead of the syntax message below.
@@ -120,25 +155,36 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// The body could not be read at all, so there is nothing to parse and
+		// nothing that was submitted.
 		writeJSON(w, http.StatusBadRequest, submitResponse{
 			Host:   site.Host,
 			Status: http.StatusBadRequest,
 			Reason: reasonBadRequest,
-			Detail: "body must be {\"urls\": [\"https://...\"]}",
+			Detail: "body could not be read",
+		})
+		return
+	}
+
+	var request submitRequest
+	if err := json.Unmarshal(raw, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, submitResponse{
+			Host:   site.Host,
+			Status: http.StatusBadRequest,
+			Reason: reasonBadRequest,
+			Detail: `body must be a single {"urls": ["https://..."]} object with no trailing data`,
 		})
 		return
 	}
 
 	result := s.client.submit(r.Context(), *site, request.URLs)
 
-	switch {
-	case result.accepted():
-		// The engine took a batch for this host, so an earlier key_rejected is
-		// no longer the current state: a key file fixed at the origin recovers
-		// on the next submission instead of waiting for a restart.
-		s.setVerified(site.Host, true)
-	case result.Reason == reasonKeyRejected:
-		s.setVerified(site.Host, false)
+	// Record a key verdict only when the submission produced one. A 200 proves
+	// the key works, 202 says validation is still pending, and 403 says the key
+	// was refused; an engine error or a rate limit says nothing about the key,
+	// so the recorded state is left alone.
+	if state := result.keyStateAfter(); state != "" {
+		s.setKeyState(site.Host, state)
 	}
 
 	status := httpStatusFor(result)
@@ -172,52 +218,120 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// healthResponse is the unauthenticated shape: counts only, never a host name.
+// /health is reachable by anything that can reach the port, and a Cloudflare
+// Tunnel makes that the whole internet, so the operator's domain list is not
+// something an anonymous GET may have.
 type healthResponse struct {
-	OK    bool `json:"ok"`
-	Sites int  `json:"sites"`
-	// Keys holds only the hosts whose key file has answered at least once.
-	// true and false are both results; a host that is absent has no result yet.
-	Keys map[string]bool `json:"keys"`
-	// Pending names the hosts still being checked. It is how "not checked yet"
-	// is told apart from "checked and failed" while the startup check runs,
-	// which is now that the listener comes up first.
-	Pending []string `json:"pending,omitempty"`
+	OK       bool `json:"ok"`
+	Sites    int  `json:"sites"`
+	Verified int  `json:"verified"`
+	Failed   int  `json:"failed"`
+	Pending  int  `json:"pending"`
 }
 
-// handleHealth answers whether the process is up. A stale key file is reported
-// in `keys` but does not fail the health check: restarting the container would
-// not fix a key file on someone else's origin.
-func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	keys, pending := s.keyStatus()
+// healthDetailResponse is the per-host view, served only to a caller that
+// proved it holds a site token.
+type healthDetailResponse struct {
+	OK    bool                `json:"ok"`
+	Sites int                 `json:"sites"`
+	Keys  map[string]keyState `json:"keys"`
+}
 
-	writeJSON(w, http.StatusOK, healthResponse{
-		OK:      true,
-		Sites:   len(s.cfg.Sites),
-		Keys:    keys,
-		Pending: pending,
+// healthErrorResponse is the refusal shape, kept separate so the success shapes
+// stay fixed.
+type healthErrorResponse struct {
+	OK     bool   `json:"ok"`
+	Status int    `json:"status"`
+	Reason string `json:"reason"`
+}
+
+// handleHealth answers whether the process is up. A stale key file is counted
+// as failed but never changes the status code: the process is up, and
+// restarting the container would not fix a key file on someone else's origin.
+func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	states := s.keyStatesSnapshot()
+
+	if !detailRequested(r) {
+		verified, failed, pending := countKeyStates(states)
+
+		writeJSON(w, http.StatusOK, healthResponse{
+			OK:       true,
+			Sites:    len(s.cfg.Sites),
+			Verified: verified,
+			Failed:   failed,
+			Pending:  pending,
+		})
+		return
+	}
+
+	// Per-host detail names the operator's domains, so it needs a token. An
+	// absent header cannot pass by accident: every configured token is at least
+	// minTokenLength characters, and an empty string never matches one.
+	if s.siteForToken(bearerToken(r.Header.Get("Authorization"))) == nil {
+		s.log.Warn("health detail rejected", "reason", reasonUnknownToken, "remote", r.RemoteAddr)
+		writeJSON(w, http.StatusUnauthorized, healthErrorResponse{
+			OK:     false,
+			Status: http.StatusUnauthorized,
+			Reason: reasonUnknownToken,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, healthDetailResponse{
+		OK:    true,
+		Sites: len(s.cfg.Sites),
+		Keys:  states,
 	})
 }
 
-// keyStatus splits the configured hosts into the ones a key check has answered
-// for and the ones it has not reached yet.
-func (s *server) keyStatus() (map[string]bool, []string) {
-	s.mu.RLock()
-	keys := make(map[string]bool, len(s.verified))
-	for host, ok := range s.verified {
-		keys[host] = ok
+// detailRequested reports whether the caller asked for the per-host view. The
+// parameter counts as soon as it is present, so ?detail, ?detail=1 and
+// ?detail=yes all work; only an explicit false switches it off, so a typo never
+// silently downgrades the response the caller asked for.
+func detailRequested(r *http.Request) bool {
+	query := r.URL.Query()
+	if !query.Has("detail") {
+		return false
 	}
-	s.mu.RUnlock()
 
-	var pending []string
+	value := strings.TrimSpace(query.Get("detail"))
+
+	return value != "0" && !strings.EqualFold(value, "false")
+}
+
+// keyStatesSnapshot returns a state for every configured host, defaulting to
+// pending, so the counts always add up to the number of sites.
+func (s *server) keyStatesSnapshot() map[string]keyState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	states := make(map[string]keyState, len(s.cfg.Sites))
 	for _, site := range s.cfg.Sites {
-		if _, known := keys[site.Host]; !known {
-			pending = append(pending, site.Host)
+		state, known := s.keyStates[site.Host]
+		if !known {
+			state = keyStatePending
+		}
+		states[site.Host] = state
+	}
+
+	return states
+}
+
+// countKeyStates turns a snapshot into the three counters /health reports.
+func countKeyStates(states map[string]keyState) (verified, failed, pending int) {
+	for _, state := range states {
+		switch state {
+		case keyStateVerified:
+			verified++
+		case keyStateFailed:
+			failed++
+		default:
+			pending++
 		}
 	}
 
-	sort.Strings(pending)
-
-	return keys, pending
+	return verified, failed, pending
 }
 
 // siteForToken compares against every configured token in constant time and
@@ -237,9 +351,9 @@ func (s *server) siteForToken(token string) *Site {
 	return found
 }
 
-func (s *server) setVerified(host string, ok bool) {
+func (s *server) setKeyState(host string, state keyState) {
 	s.mu.Lock()
-	s.verified[host] = ok
+	s.keyStates[host] = state
 	s.mu.Unlock()
 }
 
@@ -282,27 +396,44 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 // verifyAll checks every configured key file once and records the outcome. It
 // runs alongside the listener rather than before it, so three unreachable
-// origins cannot delay the first byte: each check has its own 10s timeout and
-// they would otherwise add up in front of a 5s container start period. The
-// result is advisory - it only fills in the `keys` field of /health, and a
-// failed check never stops the process.
+// origins cannot delay the first byte: each check has its own timeout and they
+// would otherwise add up in front of a 5s container start period. The result is
+// advisory - it only fills in /health, and no outcome here stops the process.
 func (s *server) verifyAll(ctx context.Context) {
 	for _, site := range s.cfg.Sites {
-		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		checkCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
 		err := s.client.verifyKey(checkCtx, site)
 		cancel()
 
-		if err != nil {
-			s.setVerified(site.Host, false)
+		state := keyStateAfterCheck(err)
+		if state == "" {
+			// Cancelled: the process is shutting down, which is nobody's key
+			// file being wrong. The recorded state stays as it is, and this is
+			// not logged at ERROR - shutdown is not a fault.
+			s.log.Debug("key file check cancelled", "host", site.Host)
+			continue
+		}
+
+		s.setKeyState(site.Host, state)
+
+		switch state {
+		case keyStateVerified:
+			s.log.Info("key file ok", "host", site.Host)
+		case keyStateFailed:
 			s.log.Error("key file check failed",
 				"host", site.Host,
 				"key_location", site.KeyLocation,
 				"error", err,
 			)
-			continue
+		default:
+			// Nothing is known: the origin did not answer, answered too slowly,
+			// or the check never ran to completion. Below ERROR because no key
+			// has been shown to be broken.
+			s.log.Warn("key file check inconclusive",
+				"host", site.Host,
+				"key_location", site.KeyLocation,
+				"error", err,
+			)
 		}
-
-		s.setVerified(site.Host, true)
-		s.log.Info("key file ok", "host", site.Host)
 	}
 }

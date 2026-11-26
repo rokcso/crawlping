@@ -420,3 +420,101 @@ func TestHTTPStatusForMapsEveryReason(t *testing.T) {
 		}
 	}
 }
+
+func TestKeyStateAfterSubmission(t *testing.T) {
+	// Only the engine's own verdicts say something about the key. A rate limit
+	// or an engine error must not be read as a broken key file.
+	cases := []struct {
+		name         string
+		engineStatus int
+		want         keyState
+	}{
+		{name: "key validated", engineStatus: http.StatusOK, want: keyStateVerified},
+		{name: "validation still pending", engineStatus: http.StatusAccepted, want: keyStatePending},
+		{name: "key refused", engineStatus: http.StatusForbidden, want: keyStateFailed},
+		{name: "rate limited proves nothing", engineStatus: http.StatusTooManyRequests, want: ""},
+		{name: "engine error proves nothing", engineStatus: http.StatusInternalServerError, want: ""},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			engine := newStubEngine(t, testCase.engineStatus, "")
+			result := engine.client().submit(context.Background(), stubSite("example.com"), []string{"https://example.com/a"})
+
+			if got := result.keyStateAfter(); got != testCase.want {
+				t.Fatalf("engine %d: key state = %q, want %q", testCase.engineStatus, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestKeyStateAfterCheck(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want keyState
+	}{
+		{name: "file read and matched", err: nil, want: keyStateVerified},
+		{
+			name: "shutdown cancelled the check",
+			err:  fmt.Errorf("%w: %w", errKeyFileUnreachable, context.Canceled),
+			want: "",
+		},
+		{
+			name: "check ran out of time",
+			err:  fmt.Errorf("%w: %w", errKeyFileUnreachable, context.DeadlineExceeded),
+			want: keyStatePending,
+		},
+		{
+			name: "origin did not answer",
+			err:  fmt.Errorf("%w: %w", errKeyFileUnreachable, errors.New("connection refused")),
+			want: keyStatePending,
+		},
+		{
+			name: "file read and refused",
+			err:  fmt.Errorf("%w: key file returned 404", errKeyFileRejected),
+			want: keyStateFailed,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := keyStateAfterCheck(testCase.err); got != testCase.want {
+				t.Fatalf("err %v: state = %q, want %q", testCase.err, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestVerifyKeySeparatesRefusedFromUnreachable(t *testing.T) {
+	// The distinction is what keeps a wrong key file apart from an origin that
+	// is simply down, so it is pinned on the errors themselves.
+	refused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer refused.Close()
+
+	site := stubSite("example.com")
+	site.KeyLocation = refused.URL + "/test-key.txt"
+
+	err := newIndexNowClient("").verifyKey(context.Background(), site)
+
+	if !errors.Is(err, errKeyFileRejected) {
+		t.Fatalf("err = %v, want it to wrap %v", err, errKeyFileRejected)
+	}
+	if errors.Is(err, errKeyFileUnreachable) {
+		t.Fatalf("a 404 was reported as unreachable: %v", err)
+	}
+
+	unreachable := stubSite("example.com")
+	unreachable.KeyLocation = "http://127.0.0.1:1/test-key.txt"
+
+	err = newIndexNowClient("").verifyKey(context.Background(), unreachable)
+
+	if !errors.Is(err, errKeyFileUnreachable) {
+		t.Fatalf("err = %v, want it to wrap %v", err, errKeyFileUnreachable)
+	}
+	if errors.Is(err, errKeyFileRejected) {
+		t.Fatalf("an unreachable origin was reported as a refused key file: %v", err)
+	}
+}

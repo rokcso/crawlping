@@ -147,22 +147,34 @@ func cmdCheck(args []string) error {
 	client := newIndexNowClient(cfg.IndexNowEndpoint)
 
 	failed := 0
+	unknown := 0
+
 	for _, site := range cfg.Sites {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		err := client.verifyKey(ctx, site)
 		cancel()
 
-		if err != nil {
+		switch keyStateAfterCheck(err) {
+		case keyStateVerified:
+			fmt.Printf("ok    %-32s %s\n", site.Host, site.KeyLocation)
+		case keyStateFailed:
 			failed++
 			fmt.Printf("FAIL  %-32s %s\n      %v\n", site.Host, site.KeyLocation, err)
-			continue
+		default:
+			// The file was never read, so nothing is known. Reporting this as a
+			// failure would blame a key file for an origin that is simply down.
+			unknown++
+			fmt.Printf("????  %-32s %s\n      could not determine: %v\n", site.Host, site.KeyLocation, err)
 		}
-
-		fmt.Printf("ok    %-32s %s\n", site.Host, site.KeyLocation)
 	}
 
-	if failed > 0 {
+	switch {
+	case failed > 0 && unknown > 0:
+		return fmt.Errorf("%d of %d key files failed, %d could not be checked", failed, len(cfg.Sites), unknown)
+	case failed > 0:
 		return fmt.Errorf("%d of %d key files failed", failed, len(cfg.Sites))
+	case unknown > 0:
+		return fmt.Errorf("%d of %d key files could not be checked", unknown, len(cfg.Sites))
 	}
 
 	return nil
@@ -213,7 +225,9 @@ func localHealthURL(listen string) string {
 	}
 
 	switch host {
-	case "", "0.0.0.0", "::", "[::]":
+	// net.SplitHostPort strips the brackets, so an IPv6 wildcard listen address
+	// arrives here as "::" and only that form needs handling.
+	case "", "0.0.0.0", "::":
 		host = "127.0.0.1"
 	}
 

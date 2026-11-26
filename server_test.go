@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const testToken = "test-token-0000000000000000"
@@ -253,12 +254,31 @@ func TestSubmitRejectsMalformedBody(t *testing.T) {
 	}
 }
 
+// callHealth performs one /health request, so a test controls the query and the
+// credentials the way a real caller would.
+func callHealth(t *testing.T, srv *server, query string, authorization string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	target := "/health"
+	if query != "" {
+		target += "?" + query
+	}
+
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+
+	recorder := httptest.NewRecorder()
+	srv.routes().ServeHTTP(recorder, req)
+
+	return recorder
+}
+
 func getHealth(t *testing.T, srv *server) healthResponse {
 	t.Helper()
 
-	recorder := httptest.NewRecorder()
-	srv.routes().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
-
+	recorder := callHealth(t, srv, "", "")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
@@ -269,6 +289,36 @@ func getHealth(t *testing.T, srv *server) healthResponse {
 	}
 
 	return body
+}
+
+func getHealthDetail(t *testing.T, srv *server) healthDetailResponse {
+	t.Helper()
+
+	recorder := callHealth(t, srv, "detail=1", "Bearer "+testToken)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+
+	var body healthDetailResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	return body
+}
+
+// keyStateFor reads the recorded state, defaulting to pending the same way the
+// server does, so a test never has to know whether an absent entry and an
+// explicit pending are stored differently.
+func keyStateFor(srv *server, host string) keyState {
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+
+	if state, known := srv.keyStates[host]; known {
+		return state
+	}
+
+	return keyStatePending
 }
 
 func TestHealthReportsSites(t *testing.T) {
@@ -282,9 +332,9 @@ func TestHealthReportsSites(t *testing.T) {
 	}
 }
 
-func TestHealthOmitsKeysUntilChecked(t *testing.T) {
-	// The listener now answers before the key checks run, so /health has to say
-	// "not known yet" rather than reporting every host as broken: a false that
+func TestHealthCountsPendingUntilChecked(t *testing.T) {
+	// The listener answers before the key checks run, so /health has to say
+	// "not known yet" rather than counting every host as broken: a failure that
 	// appears only because the check has not finished is a lie.
 	keyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("abc123def456\n"))
@@ -296,27 +346,24 @@ func TestHealthOmitsKeysUntilChecked(t *testing.T) {
 	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
 
 	pending := getHealth(t, srv)
-	if _, known := pending.Keys["example.com"]; known {
-		t.Fatalf("keys reports example.com before any check: %v", pending.Keys)
+	if !pending.OK || pending.Sites != 1 || pending.Pending != 1 || pending.Verified != 0 || pending.Failed != 0 {
+		t.Fatalf("health before the check = %+v, want one pending site", pending)
 	}
-	if len(pending.Pending) != 1 || pending.Pending[0] != "example.com" {
-		t.Fatalf("pending = %v, want [example.com]", pending.Pending)
+	if state := getHealthDetail(t, srv).Keys["example.com"]; state != keyStatePending {
+		t.Fatalf("detail state = %q, want %q", state, keyStatePending)
 	}
 
 	srv.verifyAll(context.Background())
 
 	checked := getHealth(t, srv)
-	if verified, known := checked.Keys["example.com"]; !known || !verified {
-		t.Fatalf("keys = %v, want example.com:true", checked.Keys)
-	}
-	if len(checked.Pending) != 0 {
-		t.Fatalf("pending = %v, want empty after the check finished", checked.Pending)
+	if checked.Verified != 1 || checked.Pending != 0 || checked.Failed != 0 {
+		t.Fatalf("health after the check = %+v, want one verified site", checked)
 	}
 }
 
-func TestHealthReportsFailedKeyCheck(t *testing.T) {
-	// A completed check that failed is a result, not a pending state: the host
-	// moves from `pending` into `keys` with false.
+func TestHealthCountsFailedKeyCheck(t *testing.T) {
+	// A 404 is a result: the key file was fetched and refused, so it is failed,
+	// not pending.
 	keyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
@@ -329,21 +376,203 @@ func TestHealthReportsFailedKeyCheck(t *testing.T) {
 	srv.verifyAll(context.Background())
 
 	body := getHealth(t, srv)
-	if verified, known := body.Keys["example.com"]; !known || verified {
-		t.Fatalf("keys = %v, want example.com:false", body.Keys)
-	}
-	if len(body.Pending) != 0 {
-		t.Fatalf("pending = %v, want empty", body.Pending)
+	if body.Failed != 1 || body.Verified != 0 || body.Pending != 0 {
+		t.Fatalf("health = %+v, want one failed site", body)
 	}
 	if !body.OK {
 		t.Fatal("a stale key file must not fail the health check")
 	}
+	if state := getHealthDetail(t, srv).Keys["example.com"]; state != keyStateFailed {
+		t.Fatalf("detail state = %q, want %q", state, keyStateFailed)
+	}
 }
 
-func verifiedFor(srv *server, host string) bool {
-	srv.mu.RLock()
-	defer srv.mu.RUnlock()
-	return srv.verified[host]
+func TestHealthWithoutTokenOmitsHostNames(t *testing.T) {
+	// /health needs no token, and a Cloudflare Tunnel makes it publicly
+	// reachable, so the operator's domain list must not be in it.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+	srv.setKeyState("example.com", keyStateVerified)
+
+	recorder := callHealth(t, srv, "", "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+
+	raw := recorder.Body.String()
+	if strings.Contains(raw, "example.com") {
+		t.Fatalf("unauthenticated /health names a host: %s", raw)
+	}
+
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, field := range []string{"ok", "sites", "verified", "failed", "pending"} {
+		if _, present := decoded[field]; !present {
+			t.Fatalf("response is missing %q: %s", field, raw)
+		}
+	}
+	if _, present := decoded["keys"]; present {
+		t.Fatalf("unauthenticated /health carries per-host keys: %s", raw)
+	}
+}
+
+func TestHealthDetailRequiresToken(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	cases := []struct {
+		name          string
+		query         string
+		authorization string
+	}{
+		{name: "no token", query: "detail=1"},
+		{name: "wrong token", query: "detail=1", authorization: "Bearer wrong"},
+		{name: "wrong scheme", query: "detail=1", authorization: "Basic " + testToken},
+		{name: "bare parameter", query: "detail"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := callHealth(t, srv, testCase.query, testCase.authorization)
+
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401 (%s)", recorder.Code, recorder.Body.String())
+			}
+
+			var body healthErrorResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if body.OK || body.Status != http.StatusUnauthorized || body.Reason != reasonUnknownToken {
+				t.Fatalf("unexpected refusal: %+v", body)
+			}
+			if strings.Contains(recorder.Body.String(), "example.com") {
+				t.Fatalf("a refusal names a host: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestHealthDetailListsPerHostStates(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	if state := getHealthDetail(t, srv).Keys["example.com"]; state != keyStatePending {
+		t.Fatalf("state before any check = %q, want %q", state, keyStatePending)
+	}
+
+	srv.setKeyState("example.com", keyStateFailed)
+
+	detail := getHealthDetail(t, srv)
+	if detail.Sites != 1 || detail.Keys["example.com"] != keyStateFailed {
+		t.Fatalf("detail = %+v, want example.com:failed", detail)
+	}
+
+	// The unauthenticated view stays host-free and only counts.
+	if counts := getHealth(t, srv); counts.Failed != 1 || counts.Pending != 0 {
+		t.Fatalf("counts = %+v, want one failed site", counts)
+	}
+}
+
+func TestSubmit202LeavesKeyPending(t *testing.T) {
+	// 202 means the batch was received and key validation is still pending. It
+	// is not proof the key works, so it must not be recorded as verified.
+	engine := newFakeEngine(t, http.StatusAccepted)
+	srv := newTestServer(t, engine)
+
+	recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if state := keyStateFor(srv, "example.com"); state != keyStatePending {
+		t.Fatalf("state after 202 = %q, want %q", state, keyStatePending)
+	}
+	if counts := getHealth(t, srv); counts.Verified != 0 || counts.Pending != 1 || counts.Failed != 0 {
+		t.Fatalf("health = %+v, want one pending site and nothing verified", counts)
+	}
+}
+
+func TestSubmit200MarksKeyVerified(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+	if state := keyStateFor(srv, "example.com"); state != keyStateVerified {
+		t.Fatalf("state after 200 = %q, want %q", state, keyStateVerified)
+	}
+}
+
+func TestSubmitEngineErrorLeavesKeyStateAlone(t *testing.T) {
+	// A 502 says the engine broke, not that the key file is wrong.
+	engine := newFakeEngine(t, http.StatusInternalServerError)
+	srv := newTestServer(t, engine)
+	srv.setKeyState("example.com", keyStateVerified)
+
+	post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+	if state := keyStateFor(srv, "example.com"); state != keyStateVerified {
+		t.Fatalf("state after an engine error = %q, want %q left alone", state, keyStateVerified)
+	}
+}
+
+func TestVerifyAllCanceledLeavesStateUntouched(t *testing.T) {
+	// SIGTERM cancels the check context. A check that never ran is not a broken
+	// key file, and shutdown is not a fault, so the state stays and nothing is
+	// logged at ERROR.
+	var lines bytes.Buffer
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	srv.cfg.Sites[0].KeyLocation = "http://127.0.0.1:1/key.txt"
+	srv.setKeyState("example.com", keyStateVerified)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	srv.verifyAll(ctx)
+
+	if state := keyStateFor(srv, "example.com"); state != keyStateVerified {
+		t.Fatalf("state after a cancelled check = %q, want %q", state, keyStateVerified)
+	}
+	if strings.Contains(lines.String(), "level=ERROR") {
+		t.Fatalf("a cancelled check logged at ERROR: %s", lines.String())
+	}
+}
+
+func TestVerifyAllDeadlineLeavesPending(t *testing.T) {
+	// A check that ran out of time learned nothing: it is pending, and it is
+	// logged at WARN because no key has been shown to be broken.
+	var lines bytes.Buffer
+
+	keyServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer keyServer.Close()
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, nil)))
+	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	srv.setKeyState("example.com", keyStateVerified)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	srv.verifyAll(ctx)
+
+	if state := keyStateFor(srv, "example.com"); state != keyStatePending {
+		t.Fatalf("state after a timed-out check = %q, want %q", state, keyStatePending)
+	}
+	if strings.Contains(lines.String(), "level=ERROR") {
+		t.Fatalf("an inconclusive check logged at ERROR: %s", lines.String())
+	}
+	if !strings.Contains(lines.String(), "level=WARN") {
+		t.Fatalf("an inconclusive check was not logged at WARN: %s", lines.String())
+	}
 }
 
 func TestVerifyAllMarksBrokenKeyFile(t *testing.T) {
@@ -360,8 +589,8 @@ func TestVerifyAllMarksBrokenKeyFile(t *testing.T) {
 
 	srv.verifyAll(context.Background())
 
-	if verifiedFor(srv, "example.com") {
-		t.Fatal("expected the host to be marked unverified")
+	if state := keyStateFor(srv, "example.com"); state != keyStateFailed {
+		t.Fatalf("state = %q, want %q", state, keyStateFailed)
 	}
 }
 
@@ -377,8 +606,8 @@ func TestVerifyAllMarksGoodKeyFile(t *testing.T) {
 
 	srv.verifyAll(context.Background())
 
-	if !verifiedFor(srv, "example.com") {
-		t.Fatal("expected the host to be verified")
+	if state := keyStateFor(srv, "example.com"); state != keyStateVerified {
+		t.Fatalf("state = %q, want %q", state, keyStateVerified)
 	}
 }
 
@@ -420,8 +649,8 @@ func TestSubmitRecoversKeyVerificationAfterKeyRejected(t *testing.T) {
 	if decoded["reason"] != reasonKeyRejected {
 		t.Fatalf("reason = %v, want %q", decoded["reason"], reasonKeyRejected)
 	}
-	if verifiedFor(srv, "example.com") {
-		t.Fatal("after key_rejected the host must be marked unverified")
+	if state := keyStateFor(srv, "example.com"); state != keyStateFailed {
+		t.Fatalf("after key_rejected the state = %q, want %q", state, keyStateFailed)
 	}
 
 	// The key file was fixed at the origin. Nothing restarts here, so the host
@@ -433,8 +662,8 @@ func TestSubmitRecoversKeyVerificationAfterKeyRejected(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
 	}
-	if !verifiedFor(srv, "example.com") {
-		t.Fatal("an accepted batch must mark the host verified again")
+	if state := keyStateFor(srv, "example.com"); state != keyStateVerified {
+		t.Fatalf("an accepted batch must mark the host verified again, got %q", state)
 	}
 }
 
@@ -458,5 +687,56 @@ func TestSubmitLogsEngineStatusOnlyWhenTheEngineAnswered(t *testing.T) {
 
 	if !strings.Contains(lines.String(), "engine_status=200") {
 		t.Fatalf("log is missing the engine status the engine did produce: %s", lines.String())
+	}
+}
+
+func TestSubmitRejectsTrailingData(t *testing.T) {
+	// The decoder stopped at the end of the first JSON value, so a second value
+	// after it used to be accepted and the trailing bytes silently ignored. The
+	// size cap cannot catch this: the body is small.
+	cases := map[string]string{
+		"second json value": `{"urls":["https://example.com/a"]}{"urls":["https://example.com/b"]}`,
+		"trailing garbage":  `{"urls":["https://example.com/a"]} not json`,
+	}
+
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			engine := newFakeEngine(t, http.StatusOK)
+			srv := newTestServer(t, engine)
+
+			recorder, decoded := post(t, srv, body, "Bearer "+testToken)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (%s)", recorder.Code, recorder.Body.String())
+			}
+			if decoded["reason"] != reasonBadRequest {
+				t.Fatalf("reason = %v, want %q", decoded["reason"], reasonBadRequest)
+			}
+			if engine.calls() != 0 {
+				t.Fatalf("engine was called %d times for a body with trailing data", engine.calls())
+			}
+		})
+	}
+}
+
+func TestSubmitRejectsTrailingFloodOverTheCap(t *testing.T) {
+	// The original hole: a body that fits the cap followed by far more bytes
+	// than the cap was read as "the first JSON value" and answered 200. The cap
+	// is applied while the bytes are read now, so the flood is refused.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	body := `{"urls":["https://example.com/a"]}` + strings.Repeat("x", maxBodyBytes)
+
+	recorder, decoded := post(t, srv, body, "Bearer "+testToken)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if decoded["reason"] != reasonPayloadTooLarge {
+		t.Fatalf("reason = %v, want %q", decoded["reason"], reasonPayloadTooLarge)
+	}
+	if engine.calls() != 0 {
+		t.Fatalf("engine was called %d times for an oversized body", engine.calls())
 	}
 }
