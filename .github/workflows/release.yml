@@ -1,0 +1,129 @@
+name: release
+
+# Tag-driven on purpose: pushing to main must not produce a version. A tag is
+# the only thing that should create a release.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the GitHub release
+  packages: write # push the image to GHCR
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Cheap insurance: a tag that does not pass its own tests must not be
+      # published, because deleting a release people already pulled is worse
+      # than a red workflow.
+      - name: Verify
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+          go vet ./...
+          go test ./...
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          case "$version" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "major_minor=${version%.*}" >> "$GITHUB_OUTPUT"
+          echo "version is $version"
+
+      # Cross-compiled here rather than in the Dockerfile: the image is
+      # multi-arch, but people who run without Docker want a plain binary, and
+      # producing both from one Go toolchain keeps them at the same version.
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            name="crawlping_${VERSION}_${goos}_${goarch}"
+            binary="crawlping"
+            [ "$goos" = "windows" ] && binary="crawlping.exe"
+
+            workdir="$(mktemp -d)"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath \
+              -ldflags="-s -w -X main.version=${VERSION}" \
+              -o "${workdir}/${name}/${binary}" .
+
+            if [ "$goos" = "windows" ]; then
+              (cd "$workdir" && zip -qr "${OLDPWD}/dist/${name}.zip" "${name}")
+            else
+              (cd "$workdir" && tar -czf "${OLDPWD}/dist/${name}.tar.gz" "${name}")
+            fi
+            rm -rf "$workdir"
+          done
+
+          (cd dist && sha256sum ./* > checksums.txt)
+          ls -l dist
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Multi-arch is not optional: building only amd64 and tagging it
+      # `latest` is what gives arm64 users `exec format error`.
+      - name: Build and push image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MAJOR_MINOR: ${{ steps.version.outputs.major_minor }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tags=(--tag "${IMAGE}:${VERSION}" --tag "${IMAGE}:${MAJOR_MINOR}")
+          # A prerelease must never move `latest` for everyone else.
+          if [ "$PRERELEASE" = "false" ]; then
+            tags+=(--tag "${IMAGE}:latest")
+          fi
+
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "VERSION=${VERSION}" \
+            "${tags[@]}" \
+            --push .
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=(--generate-notes)
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
