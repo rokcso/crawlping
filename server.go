@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +19,12 @@ import (
 // larger is a mistake or an attempt to make the process allocate.
 const maxBodyBytes = 64 << 10
 
+// reasonPayloadTooLarge is the only reason the handler produces on its own. It
+// lives here rather than with the engine reasons because an oversized body is
+// refused before a submission is built: no engine ever saw the payload, so
+// calling it a malformed one would send the caller looking at their syntax.
+const reasonPayloadTooLarge = "payload_too_large"
+
 type server struct {
 	cfg    *Config
 	client *indexNowClient
@@ -23,7 +32,10 @@ type server struct {
 
 	mu sync.RWMutex
 	// verified remembers the last key-file check per host, so /health can say
-	// whether submissions are currently expected to work.
+	// whether submissions are currently expected to work. A host missing from
+	// the map has not been checked yet, which is not the same as checked and
+	// failed; setVerified is the only writer, and a successful submission sets
+	// it back to true so a fixed key file recovers without a restart.
 	verified map[string]bool
 }
 
@@ -55,8 +67,11 @@ type submitResponse struct {
 	Status    int    `json:"status"`
 	Host      string `json:"host,omitempty"`
 	Submitted int    `json:"submitted"`
-	Reason    string `json:"reason,omitempty"`
-	Detail    string `json:"detail,omitempty"`
+	// Reason names why the batch was not accepted. payload_too_large is the
+	// only value the handler adds itself: the body was larger than maxBodyBytes
+	// and no submission was ever built.
+	Reason string `json:"reason,omitempty"`
+	Detail string `json:"detail,omitempty"`
 	// RetryAfterSeconds is set only for rate_limited, so a caller can schedule
 	// the retry without guessing.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
@@ -86,6 +101,25 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	var request submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		// An oversized body is not a malformed one: it can be perfectly valid
+		// JSON that simply does not fit, so it gets its own status and reason
+		// instead of the syntax message below.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.log.Warn("submit rejected",
+				"host", site.Host,
+				"reason", reasonPayloadTooLarge,
+				"remote", r.RemoteAddr,
+			)
+			writeJSON(w, http.StatusRequestEntityTooLarge, submitResponse{
+				Host:   site.Host,
+				Status: http.StatusRequestEntityTooLarge,
+				Reason: reasonPayloadTooLarge,
+				Detail: fmt.Sprintf("body exceeded the %d byte limit", maxBodyBytes),
+			})
+			return
+		}
+
 		writeJSON(w, http.StatusBadRequest, submitResponse{
 			Host:   site.Host,
 			Status: http.StatusBadRequest,
@@ -97,7 +131,13 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	result := s.client.submit(r.Context(), *site, request.URLs)
 
-	if result.Reason == reasonKeyRejected {
+	switch {
+	case result.accepted():
+		// The engine took a batch for this host, so an earlier key_rejected is
+		// no longer the current state: a key file fixed at the origin recovers
+		// on the next submission instead of waiting for a restart.
+		s.setVerified(site.Host, true)
+	case result.Reason == reasonKeyRejected:
 		s.setVerified(site.Host, false)
 	}
 
@@ -106,13 +146,20 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", strconv.Itoa(int(result.RetryAfter.Seconds())))
 	}
 
-	s.log.Info("submit",
-		"host", site.Host,
-		"engine_status", result.EngineStatus,
-		"http_status", status,
-		"submitted", result.Submitted,
-		"reason", result.Reason,
+	// engine_status is logged only when an engine actually answered. A locally
+	// refused batch leaves it at 0, and logging that would read as "the engine
+	// answered zero".
+	attrs := make([]slog.Attr, 0, 5)
+	attrs = append(attrs, slog.String("host", site.Host))
+	if result.EngineStatus != 0 {
+		attrs = append(attrs, slog.Int("engine_status", result.EngineStatus))
+	}
+	attrs = append(attrs,
+		slog.Int("http_status", status),
+		slog.Int("submitted", result.Submitted),
+		slog.String("reason", result.Reason),
 	)
+	s.log.LogAttrs(r.Context(), slog.LevelInfo, "submit", attrs...)
 
 	writeJSON(w, status, submitResponse{
 		OK:                result.accepted(),
@@ -126,15 +173,34 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 type healthResponse struct {
-	OK    bool            `json:"ok"`
-	Sites int             `json:"sites"`
-	Keys  map[string]bool `json:"keys"`
+	OK    bool `json:"ok"`
+	Sites int  `json:"sites"`
+	// Keys holds only the hosts whose key file has answered at least once.
+	// true and false are both results; a host that is absent has no result yet.
+	Keys map[string]bool `json:"keys"`
+	// Pending names the hosts still being checked. It is how "not checked yet"
+	// is told apart from "checked and failed" while the startup check runs,
+	// which is now that the listener comes up first.
+	Pending []string `json:"pending,omitempty"`
 }
 
 // handleHealth answers whether the process is up. A stale key file is reported
 // in `keys` but does not fail the health check: restarting the container would
 // not fix a key file on someone else's origin.
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	keys, pending := s.keyStatus()
+
+	writeJSON(w, http.StatusOK, healthResponse{
+		OK:      true,
+		Sites:   len(s.cfg.Sites),
+		Keys:    keys,
+		Pending: pending,
+	})
+}
+
+// keyStatus splits the configured hosts into the ones a key check has answered
+// for and the ones it has not reached yet.
+func (s *server) keyStatus() (map[string]bool, []string) {
 	s.mu.RLock()
 	keys := make(map[string]bool, len(s.verified))
 	for host, ok := range s.verified {
@@ -142,11 +208,16 @@ func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	writeJSON(w, http.StatusOK, healthResponse{
-		OK:    true,
-		Sites: len(s.cfg.Sites),
-		Keys:  keys,
-	})
+	var pending []string
+	for _, site := range s.cfg.Sites {
+		if _, known := keys[site.Host]; !known {
+			pending = append(pending, site.Host)
+		}
+	}
+
+	sort.Strings(pending)
+
+	return keys, pending
 }
 
 // siteForToken compares against every configured token in constant time and
@@ -180,6 +251,8 @@ func httpStatusFor(result submissionResult) int {
 		// The request will be refused identically if it is sent again, so it is
 		// a client error, not a host problem and not a retryable one.
 		return http.StatusBadRequest
+	case reasonPayloadTooLarge:
+		return http.StatusRequestEntityTooLarge
 	case reasonKeyRejected:
 		return http.StatusForbidden
 	case reasonHostMismatch:
@@ -208,8 +281,11 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 // verifyAll checks every configured key file once and records the outcome. It
-// runs at startup so a broken key file is visible immediately instead of
-// showing up as a 403 on the first real submission.
+// runs alongside the listener rather than before it, so three unreachable
+// origins cannot delay the first byte: each check has its own 10s timeout and
+// they would otherwise add up in front of a 5s container start period. The
+// result is advisory - it only fills in the `keys` field of /health, and a
+// failed check never stops the process.
 func (s *server) verifyAll(ctx context.Context) {
 	for _, site := range s.cfg.Sites {
 		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)

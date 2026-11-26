@@ -87,12 +87,9 @@ func cmdServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// A bad key file is reported, but it does not stop the process: the origin
-	// may simply be down, and restarting would not help.
-	srv.verifyAll(ctx)
-
+	// Addr is deliberately absent: the socket comes from net.Listen below, so
+	// there is one place that decides what is bound and one place that can fail.
 	httpServer := &http.Server{
-		Addr:              cfg.Listen,
 		Handler:           srv.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -100,14 +97,30 @@ func cmdServe(args []string) error {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// Bind before any network check runs. net.Listen returns at once, so a port
+	// that is already taken still fails loudly here instead of surfacing from a
+	// goroutine, and the process is reachable as soon as this line is done.
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return err
+	}
+
 	listenErr := make(chan error, 1)
 
 	go func() {
-		log.Info("listening", "addr", cfg.Listen, "sites", len(cfg.Sites), "version", version)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			listenErr <- err
 		}
 	}()
+
+	log.Info("listening", "addr", listener.Addr().String(), "sites", len(cfg.Sites), "version", version)
+
+	// Key verification runs after the listener and in the background. Each check
+	// may take up to 10s, so doing this first used to delay the first byte by
+	// seconds-to-minutes on a slow-but-normal start. A bad key file is reported
+	// and reflected in /health, but it does not stop the process: the origin may
+	// simply be down, and restarting would not help.
+	go srv.verifyAll(ctx)
 
 	select {
 	case err := <-listenErr:
