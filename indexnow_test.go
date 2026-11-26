@@ -269,7 +269,7 @@ func TestFilterURLsAcceptsDefaultPort(t *testing.T) {
 
 func TestFilterURLsCollapsesFragmentOnlyDuplicatesForEngine(t *testing.T) {
 	engine := newStubEngine(t, http.StatusOK, "")
-	result := engine.client().submit(context.Background(), stubSite("example.com"), []string{
+	result := engine.client().submit(stubSite("example.com"), []string{
 		"https://example.com/a#s1",
 		"https://example.com/a#s2",
 		"https://example.com/b",
@@ -293,7 +293,7 @@ func TestFilterURLsCollapsesFragmentOnlyDuplicatesForEngine(t *testing.T) {
 
 func TestSubmitLocalRefusalLeavesEngineStatusZero(t *testing.T) {
 	engine := newStubEngine(t, http.StatusOK, "")
-	result := engine.client().submit(context.Background(), stubSite("example.com"), []string{"https://example.com/ok", ""})
+	result := engine.client().submit(stubSite("example.com"), []string{"https://example.com/ok", ""})
 
 	if engine.calls != 0 {
 		t.Fatalf("engine was called %d times for a refused batch", engine.calls)
@@ -314,7 +314,7 @@ func TestSubmitLocalRefusalLeavesEngineStatusZero(t *testing.T) {
 
 func TestSubmitRefusesOversizedBatchWithoutCallingEngine(t *testing.T) {
 	engine := newStubEngine(t, http.StatusOK, "")
-	result := engine.client().submit(context.Background(), stubSite("example.com"), buildURLs("example.com", maxURLsPerRequest+1))
+	result := engine.client().submit(stubSite("example.com"), buildURLs("example.com", maxURLsPerRequest+1))
 
 	if engine.calls != 0 {
 		t.Fatalf("engine was called %d times for an oversized batch", engine.calls)
@@ -332,7 +332,7 @@ func TestSubmitRefusesOversizedBatchWithoutCallingEngine(t *testing.T) {
 
 func TestSubmitKeepsOneLineOfEngineDetail(t *testing.T) {
 	engine := newStubEngine(t, http.StatusServiceUnavailable, "upstream\n  exploded\t badly\r\n\x00\x01")
-	result := engine.client().submit(context.Background(), stubSite("example.com"), []string{"https://example.com/a"})
+	result := engine.client().submit(stubSite("example.com"), []string{"https://example.com/a"})
 
 	if result.Reason != reasonEngineError {
 		t.Fatalf("reason = %q, want %q", result.Reason, reasonEngineError)
@@ -350,7 +350,7 @@ func TestSubmitKeepsOneLineOfEngineDetail(t *testing.T) {
 
 func TestSubmitBoundsEngineDetail(t *testing.T) {
 	engine := newStubEngine(t, http.StatusInternalServerError, strings.Repeat("long-body ", 2000))
-	result := engine.client().submit(context.Background(), stubSite("example.com"), []string{"https://example.com/a"})
+	result := engine.client().submit(stubSite("example.com"), []string{"https://example.com/a"})
 
 	if result.Detail == "" {
 		t.Fatal("expected the engine body to reach Detail")
@@ -381,7 +381,7 @@ func TestSubmitMapsEngineStatusToReason(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			engine := newStubEngine(t, testCase.engineStatus, "")
-			result := engine.client().submit(context.Background(), stubSite("example.com"), []string{"https://example.com/a"})
+			result := engine.client().submit(stubSite("example.com"), []string{"https://example.com/a"})
 
 			if engine.calls != 1 {
 				t.Fatalf("engine was called %d times, want 1", engine.calls)
@@ -410,6 +410,8 @@ func TestHTTPStatusForMapsEveryReason(t *testing.T) {
 		reasonKeyRejected:      http.StatusForbidden,
 		reasonHostMismatch:     http.StatusUnprocessableEntity,
 		reasonRateLimited:      http.StatusTooManyRequests,
+		reasonThrottled:        http.StatusTooManyRequests,
+		reasonOverloaded:       http.StatusServiceUnavailable,
 		reasonEngineError:      http.StatusBadGateway,
 		"a_reason_added_later": http.StatusBadGateway,
 	}
@@ -439,7 +441,7 @@ func TestKeyStateAfterSubmission(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			engine := newStubEngine(t, testCase.engineStatus, "")
-			result := engine.client().submit(context.Background(), stubSite("example.com"), []string{"https://example.com/a"})
+			result := engine.client().submit(stubSite("example.com"), []string{"https://example.com/a"})
 
 			if got := result.keyStateAfter(); got != testCase.want {
 				t.Fatalf("engine %d: key state = %q, want %q", testCase.engineStatus, got, testCase.want)
@@ -516,5 +518,25 @@ func TestVerifyKeySeparatesRefusedFromUnreachable(t *testing.T) {
 	}
 	if errors.Is(err, errKeyFileRejected) {
 		t.Fatalf("an unreachable origin was reported as a refused key file: %v", err)
+	}
+}
+
+func TestThrottledIsNotTheEnginesRateLimit(t *testing.T) {
+	// Both are 429 and both mean "back off", but they have different owners:
+	// throttled is this instance protecting its own egress IP, rate_limited is
+	// the engine already penalising it. Sharing one reason would hide which
+	// limit the caller hit.
+	if reasonThrottled == reasonRateLimited {
+		t.Fatal("a local refusal reuses the engine's rate_limited reason")
+	}
+	if reasonOverloaded == reasonRateLimited || reasonOverloaded == reasonThrottled {
+		t.Fatal("overloaded shares a reason with another refusal")
+	}
+
+	if got := httpStatusFor(submissionResult{Reason: reasonThrottled}); got != http.StatusTooManyRequests {
+		t.Fatalf("throttled maps to %d, want 429", got)
+	}
+	if got := httpStatusFor(submissionResult{Reason: reasonOverloaded}); got != http.StatusServiceUnavailable {
+		t.Fatalf("overloaded maps to %d, want 503", got)
 	}
 }

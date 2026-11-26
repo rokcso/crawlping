@@ -294,9 +294,15 @@ func getHealth(t *testing.T, srv *server) healthResponse {
 func getHealthDetail(t *testing.T, srv *server) healthDetailResponse {
 	t.Helper()
 
-	recorder := callHealth(t, srv, "detail=1", "Bearer "+testToken)
+	return getHealthDetailWith(t, srv, "detail=1")
+}
+
+func getHealthDetailWith(t *testing.T, srv *server, query string) healthDetailResponse {
+	t.Helper()
+
+	recorder := callHealth(t, srv, query, "Bearer "+testToken)
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("detail status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+		t.Fatalf("%s: status = %d, want 200 (%s)", query, recorder.Code, recorder.Body.String())
 	}
 
 	var body healthDetailResponse
@@ -314,11 +320,20 @@ func keyStateFor(srv *server, host string) keyState {
 	srv.mu.RLock()
 	defer srv.mu.RUnlock()
 
-	if state, known := srv.keyStates[host]; known {
-		return state
+	if record, known := srv.keyStates[host]; known {
+		return record.State
 	}
 
 	return keyStatePending
+}
+
+// keyRecordFor reads the whole recorded entry, so a test can pin the timestamp
+// and the detail as well as the state.
+func keyRecordFor(srv *server, host string) keyRecord {
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+
+	return srv.keyStates[host]
 }
 
 func TestHealthReportsSites(t *testing.T) {
@@ -349,7 +364,7 @@ func TestHealthCountsPendingUntilChecked(t *testing.T) {
 	if !pending.OK || pending.Sites != 1 || pending.Pending != 1 || pending.Verified != 0 || pending.Failed != 0 {
 		t.Fatalf("health before the check = %+v, want one pending site", pending)
 	}
-	if state := getHealthDetail(t, srv).Keys["example.com"]; state != keyStatePending {
+	if state := getHealthDetail(t, srv).Keys["example.com"].State; state != keyStatePending {
 		t.Fatalf("detail state = %q, want %q", state, keyStatePending)
 	}
 
@@ -382,7 +397,7 @@ func TestHealthCountsFailedKeyCheck(t *testing.T) {
 	if !body.OK {
 		t.Fatal("a stale key file must not fail the health check")
 	}
-	if state := getHealthDetail(t, srv).Keys["example.com"]; state != keyStateFailed {
+	if state := getHealthDetail(t, srv).Keys["example.com"].State; state != keyStateFailed {
 		t.Fatalf("detail state = %q, want %q", state, keyStateFailed)
 	}
 }
@@ -392,7 +407,7 @@ func TestHealthWithoutTokenOmitsHostNames(t *testing.T) {
 	// reachable, so the operator's domain list must not be in it.
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.setKeyState("example.com", keyStateVerified)
+	srv.setKeyState("example.com", keyStateVerified, "")
 
 	recorder := callHealth(t, srv, "", "")
 
@@ -460,14 +475,14 @@ func TestHealthDetailListsPerHostStates(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
 
-	if state := getHealthDetail(t, srv).Keys["example.com"]; state != keyStatePending {
+	if state := getHealthDetail(t, srv).Keys["example.com"].State; state != keyStatePending {
 		t.Fatalf("state before any check = %q, want %q", state, keyStatePending)
 	}
 
-	srv.setKeyState("example.com", keyStateFailed)
+	srv.setKeyState("example.com", keyStateFailed, "")
 
 	detail := getHealthDetail(t, srv)
-	if detail.Sites != 1 || detail.Keys["example.com"] != keyStateFailed {
+	if detail.Sites != 1 || detail.Keys["example.com"].State != keyStateFailed {
 		t.Fatalf("detail = %+v, want example.com:failed", detail)
 	}
 
@@ -511,7 +526,7 @@ func TestSubmitEngineErrorLeavesKeyStateAlone(t *testing.T) {
 	// A 502 says the engine broke, not that the key file is wrong.
 	engine := newFakeEngine(t, http.StatusInternalServerError)
 	srv := newTestServer(t, engine)
-	srv.setKeyState("example.com", keyStateVerified)
+	srv.setKeyState("example.com", keyStateVerified, "")
 
 	post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
 
@@ -529,7 +544,7 @@ func TestVerifyAllCanceledLeavesStateUntouched(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	srv.cfg.Sites[0].KeyLocation = "http://127.0.0.1:1/key.txt"
-	srv.setKeyState("example.com", keyStateVerified)
+	srv.setKeyState("example.com", keyStateVerified, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -557,7 +572,7 @@ func TestVerifyAllDeadlineLeavesPending(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, nil)))
 	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
-	srv.setKeyState("example.com", keyStateVerified)
+	srv.setKeyState("example.com", keyStateVerified, "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -738,5 +753,495 @@ func TestSubmitRejectsTrailingFloodOverTheCap(t *testing.T) {
 	}
 	if engine.calls() != 0 {
 		t.Fatalf("engine was called %d times for an oversized body", engine.calls())
+	}
+}
+
+// --- the egress guard -------------------------------------------------------
+
+// otherHost and otherToken are the second site a per-site test needs: the point
+// of keying the bucket on the host is that one site's exhaustion cannot touch
+// another.
+const (
+	otherHost  = "shop.example.org"
+	otherToken = "second-site-token"
+)
+
+// newTwoSiteServer builds a server with two configured hosts, each with its own
+// token, so a test can exhaust one and check the other.
+func newTwoSiteServer(t *testing.T, engine *fakeEngine) *server {
+	t.Helper()
+
+	cfg := &Config{
+		Listen: "127.0.0.1:0",
+		Sites: []Site{
+			{
+				Host:        "example.com",
+				IndexNowKey: "abc123def456",
+				KeyLocation: "https://example.com/abc123def456.txt",
+				Token:       testToken,
+			},
+			{
+				Host:        otherHost,
+				IndexNowKey: "abc123def456",
+				KeyLocation: "https://shop.example.org/abc123def456.txt",
+				Token:       otherToken,
+			},
+		},
+	}
+
+	return newServer(cfg, newIndexNowClient(engine.server.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// frozenClock is a clock a test moves by hand. Refill is computed from elapsed
+// time, so a test that waited in real time would be slow and still racy;
+// stepping the clock is exact and costs nothing.
+type frozenClock struct {
+	now time.Time
+}
+
+func newFrozenClock() *frozenClock {
+	return &frozenClock{now: time.Now()}
+}
+
+func (c *frozenClock) Now() time.Time {
+	return c.now
+}
+
+func (c *frozenClock) advance(d time.Duration) {
+	c.now = c.now.Add(d)
+}
+
+func TestRateBucketRefusesWhenTheBurstIsSpent(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	// The clock stands still: this test measures the burst, not how fast the
+	// machine can send eleven requests.
+	clock := newFrozenClock()
+	srv.rate.now = clock.Now
+
+	for i := 0; i < rateBurstTokens; i++ {
+		recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200 (%s)", i+1, recorder.Code, recorder.Body.String())
+		}
+		if decoded["reason"] != nil {
+			t.Fatalf("request %d: reason = %v, want none", i+1, decoded["reason"])
+		}
+	}
+
+	if got := engine.calls(); got != rateBurstTokens {
+		t.Fatalf("engine calls = %d, want %d", got, rateBurstTokens)
+	}
+
+	// The (capacity+1)th request in the same instant is refused locally.
+	recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if decoded["reason"] != reasonThrottled {
+		t.Fatalf("reason = %v, want %q", decoded["reason"], reasonThrottled)
+	}
+	if got := recorder.Header().Get("Retry-After"); got == "" {
+		t.Fatal("a throttled response carries no Retry-After header")
+	}
+	if decoded["retry_after_seconds"] != float64(1) {
+		t.Fatalf("retry_after_seconds = %v, want 1", decoded["retry_after_seconds"])
+	}
+	if _, present := decoded["engine_status"]; present {
+		t.Fatalf("a locally throttled batch reports an engine status: %v", decoded)
+	}
+	// Refused by the guard, so the engine never sees it: spending the egress IP
+	// on this request is exactly what the guard exists to prevent.
+	if got := engine.calls(); got != rateBurstTokens {
+		t.Fatalf("engine calls after a local refusal = %d, want %d", got, rateBurstTokens)
+	}
+}
+
+func TestRateLimitIsPerSite(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTwoSiteServer(t, engine)
+
+	clock := newFrozenClock()
+	srv.rate.now = clock.Now
+
+	for i := 0; i < rateBurstTokens; i++ {
+		if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, recorder.Code)
+		}
+	}
+
+	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("exhausted host answered %d, want 429", recorder.Code)
+	}
+
+	// The other site has spent nothing, so it must not inherit its neighbour's
+	// limit: one noisy site is not allowed to silence the rest.
+	recorder, decoded := post(t, srv, `{"urls":["https://`+otherHost+`/a"]}`, "Bearer "+otherToken)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("other site: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if decoded["host"] != otherHost {
+		t.Fatalf("other site: host = %v, want %q", decoded["host"], otherHost)
+	}
+	if got := engine.calls(); got != rateBurstTokens+1 {
+		t.Fatalf("engine calls = %d, want %d", got, rateBurstTokens+1)
+	}
+}
+
+func TestRefillAllowsTheNextRequest(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	// A bucket of one token that refills every 100ms: the shortest interval a
+	// test can observe without sleeping.
+	srv.rate = newRateBucket(1, 100*time.Millisecond)
+	clock := newFrozenClock()
+	srv.rate.now = clock.Now
+
+	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+		t.Fatalf("first request: status = %d, want 200", recorder.Code)
+	}
+
+	recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+	if recorder.Code != http.StatusTooManyRequests || decoded["reason"] != reasonThrottled {
+		t.Fatalf("second request: status = %d reason = %v, want 429 %q", recorder.Code, decoded["reason"], reasonThrottled)
+	}
+
+	clock.advance(100 * time.Millisecond)
+
+	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+		t.Fatalf("after a refill: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+
+	if got := engine.calls(); got != 2 {
+		t.Fatalf("engine calls = %d, want 2", got)
+	}
+}
+
+func TestRateBucketDoesNotRefillFromABackwardsClock(t *testing.T) {
+	// Elapsed time is the only thing that mints tokens, and a clock that jumps
+	// backwards must not mint any: a wall-clock step is not work done.
+	bucket := newRateBucket(1, time.Second)
+	clock := newFrozenClock()
+	bucket.now = clock.Now
+
+	if wait := bucket.take("example.com"); wait != 0 {
+		t.Fatalf("first take waited %s, want 0", wait)
+	}
+
+	clock.advance(-time.Hour)
+
+	if wait := bucket.take("example.com"); wait == 0 {
+		t.Fatal("a backwards clock refilled the bucket")
+	}
+}
+
+func TestOverloadedWhenNoEngineSlotIsFree(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	srv.inflight = newInflightGuard(1)
+	// The wait is 2s in production; a test that spent 2s waiting would be slow,
+	// and the behaviour under test is what happens when the wait runs out.
+	srv.inflight.wait = 20 * time.Millisecond
+
+	// Hold the only slot, as an engine request still in flight would.
+	srv.inflight.slots <- struct{}{}
+
+	recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if decoded["reason"] != reasonOverloaded {
+		t.Fatalf("reason = %v, want %q", decoded["reason"], reasonOverloaded)
+	}
+	if got := recorder.Header().Get("Retry-After"); got == "" {
+		t.Fatal("an overloaded response carries no Retry-After header")
+	}
+	if decoded["retry_after_seconds"] == nil {
+		t.Fatalf("an overloaded response carries no retry_after_seconds: %v", decoded)
+	}
+	// No slot, so no engine call: the cap is there to keep the engine's side of
+	// the connection finite, and a request that got no slot never becomes one.
+	if got := engine.calls(); got != 0 {
+		t.Fatalf("engine was called %d times without a free slot", got)
+	}
+
+	// Once the slot is free the same request goes through, so a full instance
+	// is busy rather than broken.
+	srv.inflight.release()
+
+	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+		t.Fatalf("after the slot was freed: status = %d, want 200", recorder.Code)
+	}
+	if got := engine.calls(); got != 1 {
+		t.Fatalf("engine calls = %d, want 1", got)
+	}
+}
+
+func TestSubmitSeparatesEngineRefusalFromLocalRefusal(t *testing.T) {
+	// Both answers are 422 host_mismatch, and they need different fixes from
+	// different people: the engine refused what the caller sent, while this
+	// instance refused to send it at all. engine_status is the only field that
+	// tells them apart, so it must be present on the first and absent on the
+	// second.
+	engine := newFakeEngine(t, http.StatusUnprocessableEntity)
+	srv := newTestServer(t, engine)
+
+	recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("engine refusal: status = %d, want 422", recorder.Code)
+	}
+	if decoded["reason"] != reasonHostMismatch {
+		t.Fatalf("engine refusal: reason = %v, want %q", decoded["reason"], reasonHostMismatch)
+	}
+	if decoded["engine_status"] != float64(http.StatusUnprocessableEntity) {
+		t.Fatalf("engine refusal: engine_status = %v, want 422", decoded["engine_status"])
+	}
+
+	recorder, decoded = post(t, srv, `{"urls":["https://attacker.test/a"]}`, "Bearer "+testToken)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("local refusal: status = %d, want 422", recorder.Code)
+	}
+	if decoded["reason"] != reasonHostMismatch {
+		t.Fatalf("local refusal: reason = %v, want %q", decoded["reason"], reasonHostMismatch)
+	}
+	if _, present := decoded["engine_status"]; present {
+		t.Fatalf("local refusal claims an engine status: %v", decoded)
+	}
+	if got := engine.calls(); got != 1 {
+		t.Fatalf("engine calls = %d, want 1 (the locally refused batch never reached it)", got)
+	}
+}
+
+func TestSubmitLogsDurationAndRemote(t *testing.T) {
+	var lines bytes.Buffer
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, nil)))
+
+	post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+
+	logged := lines.String()
+	if !strings.Contains(logged, "duration_ms=") {
+		t.Fatalf("submit log is missing duration_ms: %s", logged)
+	}
+	if !strings.Contains(logged, "remote=") {
+		t.Fatalf("submit log is missing remote: %s", logged)
+	}
+}
+
+func TestSubmitFinishesAfterTheCallerGivesUp(t *testing.T) {
+	// A caller that times out must not cancel the POST to the engine: the URL
+	// set is already decided, and the engine may already have received the
+	// notice, so the caller's patience cannot change the outcome.
+	// The engine takes 50ms to answer, and the caller is already gone by then.
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-time.After(50 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(engine.Close)
+
+	cfg := &Config{
+		Listen: "127.0.0.1:0",
+		Sites: []Site{{
+			Host:        "example.com",
+			IndexNowKey: "abc123def456",
+			KeyLocation: "https://example.com/abc123def456.txt",
+			Token:       testToken,
+		}},
+	}
+	srv := newServer(cfg, newIndexNowClient(engine.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := httptest.NewRequest(http.MethodPost, "/submit", strings.NewReader(`{"urls":["https://example.com/a"]}`))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	req = req.WithContext(ctx)
+
+	recorder := httptest.NewRecorder()
+	srv.routes().ServeHTTP(recorder, req)
+
+	// The engine answered after the caller had already gone, and the answer is
+	// the engine's, not a cancelled request.
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if state := keyStateFor(srv, "example.com"); state != keyStateVerified {
+		t.Fatalf("state after an accepted batch = %q, want %q", state, keyStateVerified)
+	}
+}
+
+// --- key records ------------------------------------------------------------
+
+func TestHealthDetailReportsCheckedAtAndDetail(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	srv.setKeyState("example.com", keyStateFailed, "key file returned 404")
+
+	recorder := callHealth(t, srv, "detail=1", "Bearer "+testToken)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+
+	// The per-host value is an object, not a bare state word, so a caller can
+	// see how old the answer is and what went wrong.
+	var body struct {
+		Keys map[string]map[string]json.RawMessage `json:"keys"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	record, present := body.Keys["example.com"]
+	if !present {
+		t.Fatalf("keys has no entry for example.com: %s", recorder.Body.String())
+	}
+	for _, field := range []string{"state", "checked_at", "detail"} {
+		if _, present := record[field]; !present {
+			t.Fatalf("key record is missing %q: %s", field, recorder.Body.String())
+		}
+	}
+
+	var state keyState
+	if err := json.Unmarshal(record["state"], &state); err != nil || state != keyStateFailed {
+		t.Fatalf("state = %s (%v), want %q", record["state"], err, keyStateFailed)
+	}
+
+	var detail string
+	if err := json.Unmarshal(record["detail"], &detail); err != nil || detail != "key file returned 404" {
+		t.Fatalf("detail = %s (%v), want the failure reason", record["detail"], err)
+	}
+
+	var checkedAt time.Time
+	if err := json.Unmarshal(record["checked_at"], &checkedAt); err != nil {
+		t.Fatalf("checked_at is not an RFC 3339 time: %s (%v)", record["checked_at"], err)
+	}
+	if time.Since(checkedAt) > time.Minute {
+		t.Fatalf("checked_at = %s, want the time the state was recorded", checkedAt)
+	}
+
+	// The unauthenticated view keeps its counts-only shape.
+	if strings.Contains(callHealth(t, srv, "", "").Body.String(), "example.com") {
+		t.Fatal("the aggregate view names a host")
+	}
+}
+
+func TestRecheckRefreshesCheckedAt(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+
+	keyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+
+		_, _ = w.Write([]byte("abc123def456\n"))
+	}))
+	defer keyServer.Close()
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+
+	stale := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	srv.mu.Lock()
+	srv.keyStates["example.com"] = keyRecord{State: keyStateFailed, CheckedAt: stale, Detail: "stale answer"}
+	srv.mu.Unlock()
+
+	keyFetches := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits
+	}
+
+	// Reading the detail view answers from what is recorded: it does not fetch
+	// anything, which is the whole reason ?recheck=1 exists.
+	before := getHealthDetail(t, srv).Keys["example.com"]
+	if before.State != keyStateFailed || !before.CheckedAt.Equal(stale) || before.Detail != "stale answer" {
+		t.Fatalf("detail before a recheck = %+v, want the recorded answer", before)
+	}
+	if got := keyFetches(); got != 0 {
+		t.Fatalf("detail=1 fetched the key file %d times", got)
+	}
+
+	after := getHealthDetailWith(t, srv, "detail=1&recheck=1").Keys["example.com"]
+
+	if after.State != keyStateVerified {
+		t.Fatalf("state after a recheck = %q, want %q", after.State, keyStateVerified)
+	}
+	if after.Detail != "" {
+		t.Fatalf("detail after a verified recheck = %q, want empty", after.Detail)
+	}
+	if !after.CheckedAt.After(stale) {
+		t.Fatalf("checked_at after a recheck = %s, want later than %s", after.CheckedAt, stale)
+	}
+	if got := keyFetches(); got != 1 {
+		t.Fatalf("recheck fetched the key file %d times, want 1", got)
+	}
+}
+
+func TestRecheckCutShortDoesNotDowngrade(t *testing.T) {
+	// A recheck that runs out of budget learned nothing about the key file. It
+	// must not turn a good state into a bad one just because this instance ran
+	// out of patience.
+	keyServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer keyServer.Close()
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	srv.recheckTimeout = 20 * time.Millisecond
+	srv.setKeyState("example.com", keyStateVerified, "")
+
+	after := getHealthDetailWith(t, srv, "detail=1&recheck=1").Keys["example.com"]
+
+	if after.State != keyStateVerified {
+		t.Fatalf("state after a cut-short recheck = %q, want %q left alone", after.State, keyStateVerified)
+	}
+}
+
+func TestHealthDetailRecheckRequiresToken(t *testing.T) {
+	// A recheck must never be reachable unauthenticated: it would let anything
+	// that can reach the port make this instance fetch from the operator's
+	// origins.
+	var mu sync.Mutex
+	hits := 0
+
+	keyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+
+		_, _ = w.Write([]byte("abc123def456\n"))
+	}))
+	defer keyServer.Close()
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+
+	for _, authorization := range []string{"", "Bearer wrong"} {
+		recorder := callHealth(t, srv, "detail=1&recheck=1", authorization)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%q: status = %d, want 401", authorization, recorder.Code)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("an unauthenticated recheck fetched the key file %d times", hits)
 	}
 }

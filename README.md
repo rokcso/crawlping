@@ -186,14 +186,47 @@ ignored. Together they describe the one shape the endpoint accepts: a single
 `{"urls": [...]}` object, then the end of the body.
 
 ```json
-{"ok": true, "status": 200, "host": "example.com", "submitted": 2}
+{"ok": true, "status": 200, "host": "example.com", "submitted": 2, "engine_status": 200}
 ```
 
 `status` is the HTTP status of **this** response, the same number as the status
-line. It is not the engine's status. A batch refused locally was never sent, so
-there is no engine status to report, and reporting one would be a status no
-engine ever returned. The engine's own status appears in the request's log line
-as `engine_status`, and only when an engine actually answered.
+line. It is not the engine's status. `engine_status` is the engine's own status,
+and it is absent whenever the engine was never called - `throttled`,
+`overloaded`, `payload_too_large` and every other local refusal leave it out,
+because reporting a status no engine ever returned would be an invention.
+
+The two fields together answer a question one of them cannot: a `422` with
+`"reason": "host_mismatch"` and `"engine_status": 422` is the engine refusing
+what you sent, while the same `422` with no `engine_status` is this instance
+refusing to send it at all. Same reason, two different fixes, two different
+owners.
+
+#### Rate and concurrency limits
+
+A token is bound to one host, so nobody can submit for a domain they do not own.
+Frequency is bounded too, because the egress IP belongs to the operator and the
+engine throttles it, not the caller:
+
+- **10 requests back to back per host**, then one more per second. The burst and
+the refill are per host, so one noisy site cannot silence another.
+- **8 engine requests in flight at once**, across every site. A request that
+finds no free slot waits up to 2 seconds for one, then gives up.
+
+IndexNow does not publish its limits, so these are deliberately conservative.
+They exist to keep a leaked token or a retry loop in one caller from pushing the
+operator's IP into the engine's throttle - which would break the legitimate
+submissions too, and is the exact harm this tool exists to avoid. A refused
+request is answered locally and never reaches the engine.
+
+There are two different `429`s and they are worth telling apart:
+
+| `reason` | Owner | What happened |
+|---|---|---|
+| `throttled` | this instance | this host spent its burst; the engine was never called, and the egress IP is unharmed |
+| `rate_limited` | the engine | the engine is already throttling this IP |
+
+Both carry `Retry-After` and `retry_after_seconds`. Only the second one means
+the operator's IP is being penalised; the first one is the guard doing its job.
 
 ### `GET /health`
 
@@ -225,8 +258,20 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/health?detail=1
 ```
 
 ```json
-{"ok": true, "sites": 2, "keys": {"example.com": "verified", "shop.example.org": "pending"}}
+{"ok": true, "sites": 2, "keys": {"example.com": {"state": "verified", "checked_at": "2026-11-27T09:14:02Z", "detail": ""}, "shop.example.org": {"state": "pending"}}}
 ```
+
+Each host maps to an object rather than a bare state word, so an operator can
+see more than the last verdict:
+
+| Field | Meaning |
+|---|---|
+| `state` | one of the three key states below |
+| `checked_at` | when that state was recorded, in UTC; absent while the host has never been checked |
+| `detail` | the reason the last check failed or came back inconclusive, empty when `verified` |
+
+`checked_at` is what stops `verified` from lying: a key file that broke an hour
+ago is `verified` with an old timestamp, and the age is the warning.
 
 A missing, empty, wrong or unknown token is refused before a single host name is
 written, so a failed guess learns nothing:
@@ -238,7 +283,25 @@ written, so a failed guess learns nothing:
 `detail` counts as soon as the parameter is present, so `?detail`, `?detail=1`
 and `?detail=yes` all ask for the per-host view. Only `?detail=0` and
 `?detail=false` switch it off, so a typo fails towards the answer that was asked
-for rather than away from it.
+for rather than away from it. `recheck` follows the same rule.
+
+#### `GET /health?detail=1&recheck=1`
+
+`recheck=1` runs the key-file check for every configured host before answering,
+bounded by a 5 second budget, so an operator who has just fixed a key file gets
+a fresh answer instead of an old one:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8080/health?detail=1&recheck=1'
+```
+
+There is no background timer and no periodic loop. A key file changes about
+never, so a recurring check would pay a permanent cost - a fetch per host,
+forever - for a rare event; an on-demand check costs only when it is asked for.
+A recheck that runs out of its 5 second budget leaves the recorded state alone
+rather than downgrading a good key because this instance ran out of patience,
+and a recheck is refused without a token like any other detail request.
 
 ### Key states
 
@@ -262,6 +325,10 @@ as it was. A host that is `failed` recovers by itself: the next accepted
 submission with engine `200` sets it back to `verified`, so a key file fixed at
 the origin does not need a restart.
 
+`/health?detail=1` reports each state with the time it was recorded and the
+reason behind it, so `verified` cannot quietly describe a key file that broke an
+hour ago, and `failed` says what failed rather than only that something did.
+
 The check runs **after** the listener is up and in the background, so slow or
 unreachable origins cannot delay the first byte, and no outcome here stops the
 process.
@@ -283,15 +350,22 @@ Your caller decides whether to retry.
 | 403 | `key_rejected` | the engine did not accept the key file; also marks the host `failed` | no - fix the key |
 | 413 | `payload_too_large` | the body was larger than the 65536 byte limit | no - send fewer URLs |
 | 422 | `host_mismatch` | a URL was not on the site's own host | no - fix the caller |
-| 429 | `rate_limited` | engine is throttling; see `Retry-After` | yes, later |
+| 429 | `rate_limited` | the engine is throttling this IP; see `Retry-After` | yes, later |
+| 429 | `throttled` | this instance refused to spend any more of its egress IP on this host right now; the engine was not called | yes, after `Retry-After` |
 | 502 | `engine_error` | engine 5xx or the request never landed | yes, later |
+| 503 | `overloaded` | every engine slot was in use and none freed up within 2 seconds; the engine was not called | yes, shortly |
 
-Only `429` and `502` are worth retrying. Every other status is the same answer
-if the identical request is sent again. `engine_rejected` is the one to read
-carefully: the engine understood the payload and refused it, so retrying is
+Only `429`, `502` and `503` are worth retrying. Every other status is the same
+answer if the identical request is sent again. `engine_rejected` is the one to
+read carefully: the engine understood the payload and refused it, so retrying is
 pointless until the payload changes. An oversized body is reported as
 `payload_too_large` rather than as `bad_request`, because the JSON may be valid
 and only too large.
+
+Two `429`s, two meanings. `throttled` is this instance protecting its own egress
+IP, so nothing was sent and the engine never saw the request; `rate_limited` is
+the engine's answer, so the IP is already being penalised. A caller that needs to
+know whose limit it hit reads the reason, not the status code.
 
 `detail` carries the engine's own explanation for a refusal, truncated to one
 short line with whitespace collapsed and control characters dropped, or the
@@ -313,15 +387,21 @@ const res = await fetch("https://crawlping.example.net/submit", {
 });
 
 const result = await res.json();
-if (res.status === 429) {
+if (res.status === 429 || res.status === 503) {
   // Queue it for later: `result.retry_after_seconds` says for how long.
+  // `result.reason` says whose limit it was: `throttled` (this instance) or
+  // `rate_limited` (the engine).
+  if (result.reason === "rate_limited") {
+    // The IP is already being throttled: stop sending for a while.
+  }
 }
 ```
 
 ## What it deliberately does not do
 
 - No sitemap watching or diffing. You send the URLs you changed.
-- No retry loop. `429` is reported so your code can decide.
+- No retry loop. `429`, `502` and `503` are reported so your code can decide;
+the instance only bounds how much it will spend on your behalf.
 - No database, no UI, no accounts.
 - No Google. Google's Indexing API accepts only `JobPosting` and
   `BroadcastEvent`, so no tool can submit ordinary pages to Google.

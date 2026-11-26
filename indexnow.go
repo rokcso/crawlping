@@ -52,6 +52,12 @@ const maxURLsPerRequest = 100
 // worth the allocation.
 const maxEngineDetailBytes = 512
 
+// engineTimeout bounds one request to the engine, headers and body. It is also
+// the client's timeout, so the two cannot disagree: the cancel comes from this
+// context, not from the caller's, because a caller that gives up must not be
+// able to recall a notification that may already have been received.
+const engineTimeout = 15 * time.Second
+
 // Why a key-file check reached no answer, separated from the check reaching a
 // bad answer. Only the second is evidence that the key is broken: an origin
 // that is down, and a key file that is wrong, need different things from the
@@ -132,7 +138,7 @@ type indexNowClient struct {
 func newIndexNowClient(endpoint string) *indexNowClient {
 	return &indexNowClient{
 		endpoint: endpoint,
-		http:     &http.Client{Timeout: 15 * time.Second},
+		http:     &http.Client{Timeout: engineTimeout},
 	}
 }
 
@@ -191,7 +197,13 @@ func keyStateAfterCheck(err error) keyState {
 }
 
 // submit posts the batch and translates the engine's status into a reason.
-func (c *indexNowClient) submit(ctx context.Context, site Site, urls []string) submissionResult {
+//
+// It takes no caller context on purpose. The URL set is already decided by the
+// time this runs, so the caller's patience cannot change the outcome - and
+// cancelling the POST because the caller timed out would not un-send a notice
+// the engine may already have received. The call therefore gets its own timeout
+// from context.Background and cancels it when it returns.
+func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 	clean, err := filterURLs(site.Host, urls)
 	if err != nil {
 		// Locally refused: the engine was never called, so EngineStatus stays
@@ -212,7 +224,10 @@ func (c *indexNowClient) submit(ctx context.Context, site Site, urls []string) s
 		return submissionResult{Reason: reasonEngineError, Detail: err.Error()}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
+	reqCtx, cancel := context.WithTimeout(context.Background(), engineTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return submissionResult{Reason: reasonEngineError, Detail: err.Error()}
 	}
