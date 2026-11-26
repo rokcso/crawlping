@@ -202,7 +202,7 @@ func (c *indexNowClient) submit(ctx context.Context, site Site, urls []string) s
 // the entry that caused the refusal, and a batch with one unusable entry is
 // never reported as "no usable urls".
 func filterURLs(host string, urls []string) (clean []string, err error) {
-	want := normalizeHost(host)
+	want := canonicalHost(host)
 	seen := make(map[string]bool, len(urls))
 
 	for i, raw := range urls {
@@ -223,7 +223,7 @@ func filterURLs(host string, urls []string) (clean []string, err error) {
 			)
 		}
 
-		if normalizeHost(parsed.Hostname()) != want {
+		if canonicalHost(parsed.Hostname()) != want {
 			return nil, fmt.Errorf("%w: %q is not on %s", errForeignHost, trimmed, want)
 		}
 
@@ -253,11 +253,11 @@ func filterURLs(host string, urls []string) (clean []string, err error) {
 	return clean, nil
 }
 
-// normalizeHost folds the two things that are not part of a host's identity:
-// its case and the trailing dot of an absolute DNS name. Both sides of the
-// comparison go through it, so a configured "Example.com." still matches
-// https://example.com/...
-func normalizeHost(host string) string {
+// canonicalHost folds the two things that are not part of a host's identity:
+// its case and the trailing dot of an absolute DNS name. This is the comparison
+// form only; config.normalizeHost is the validating one, and a config value has
+// already been through it by the time a request is served.
+func canonicalHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 }
 
