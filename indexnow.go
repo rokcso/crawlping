@@ -147,6 +147,11 @@ func newIndexNowClient(endpoint string) *indexNowClient {
 // discovering per request. Every error says which of the two things happened:
 // the file was read and is wrong, or it was never read at all.
 func (c *indexNowClient) verifyKey(ctx context.Context, site Site) error {
+	// The key_location/host agreement is enforced in loadConfig, not here: it is
+	// a property of the configuration, it needs no network, and checking it on
+	// this path made every test fixture that serves its key from 127.0.0.1 look
+	// like a broken site.
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, site.KeyLocation, nil)
 	if err != nil {
 		return fmt.Errorf("%w: build key request: %w", errKeyFileUnreachable, err)

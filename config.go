@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -132,6 +133,15 @@ func loadConfig(path string) (*Config, error) {
 		if site.KeyLocation == "" {
 			site.KeyLocation = fmt.Sprintf("https://%s/%s.txt", site.Host, site.IndexNowKey)
 		}
+
+		// IndexNow proves ownership by fetching the key from the host being
+		// submitted for, so a key file served from anywhere else is refused with
+		// 422 no matter what it contains. That is a property of the
+		// configuration and needs no network to detect, which is why it is
+		// checked here rather than on the submission path.
+		if err := checkKeyLocationHost(*site); err != nil {
+			return nil, fmt.Errorf("site %s: %w", site.Host, err)
+		}
 	}
 
 	return &cfg, nil
@@ -183,4 +193,33 @@ func hint(value string, max int) string {
 		return value
 	}
 	return value[:max] + "..."
+}
+
+// checkKeyLocationHost refuses a key_location that cannot answer for the site's
+// host. Both sides are compared in canonical form, so case and a trailing dot
+// do not matter.
+func checkKeyLocationHost(site Site) error {
+	parsed, err := url.Parse(site.KeyLocation)
+	if err != nil {
+		return fmt.Errorf("key_location %q is not a URL", site.KeyLocation)
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("key_location %q must be an http or https URL", site.KeyLocation)
+	}
+
+	found := parsed.Hostname()
+	if found == "" {
+		return fmt.Errorf("key_location %q has no host", site.KeyLocation)
+	}
+
+	got, want := canonicalHost(found), canonicalHost(site.Host)
+	if got != want {
+		return fmt.Errorf(
+			"key_location %q is served from %s, but the site is %s; the key file has to be on the host that is submitted for",
+			site.KeyLocation, got, want,
+		)
+	}
+
+	return nil
 }

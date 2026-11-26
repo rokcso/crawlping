@@ -279,3 +279,55 @@ func TestLoadConfigMissingFile(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+func TestLoadConfigRejectsAKeyLocationOnAnotherHost(t *testing.T) {
+	// IndexNow fetches the key from the host being submitted for, so a key file
+	// that lives somewhere else is refused with 422 whatever it contains. That
+	// is knowable without any network access, so it must not survive loading.
+	cases := map[string]string{
+		"another host": `
+sites:
+  - host: example.com
+    indexnow_key: good-key-1234
+    key_location: https://elsewhere.test/key.txt
+    token: token-shared-for-two-sites
+`,
+		"no scheme": `
+sites:
+  - host: example.com
+    indexnow_key: good-key-1234
+    key_location: example.com/key.txt
+    token: token-shared-for-two-sites
+`,
+		"no host": `
+sites:
+  - host: example.com
+    indexnow_key: good-key-1234
+    key_location: "/key.txt"
+    token: token-shared-for-two-sites
+`,
+	}
+
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadConfig(writeConfig(t, body)); err == nil {
+				t.Fatal("expected the key_location to be refused")
+			}
+		})
+	}
+
+	// The same host in another case, and an explicit key_location that agrees,
+	// both have to load.
+	for _, keyLocation := range []string{"https://example.com/other/path/key.txt", "https://EXAMPLE.com./key.txt"} {
+		body := `
+sites:
+  - host: example.com
+    indexnow_key: good-key-1234
+    key_location: ` + keyLocation + `
+    token: token-shared-for-two-sites
+`
+		if _, err := loadConfig(writeConfig(t, body)); err != nil {
+			t.Fatalf("%s should load: %v", keyLocation, err)
+		}
+	}
+}
