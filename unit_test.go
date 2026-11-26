@@ -76,13 +76,20 @@ func TestFilterURLs(t *testing.T) {
 }
 
 func TestFilterURLsCapsBatchSize(t *testing.T) {
+	// The cap is applied by the submit path now, with the configured number, so
+	// this pins that a batch over the default is refused there and that the
+	// refusal names the limit it broke.
 	urls := make([]string, 0, maxURLsPerRequest+1)
 	for i := 0; i <= maxURLsPerRequest; i++ {
 		urls = append(urls, fmt.Sprintf("https://example.com/page-%d", i))
 	}
 
-	if _, err := filterURLs("example.com", urls); err == nil {
-		t.Fatal("expected an oversized batch to be refused")
+	clean, err := filterURLs("example.com", urls)
+	if err != nil {
+		t.Fatalf("filterURLs refused the batch: %v", err)
+	}
+	if len(clean) <= maxURLsPerRequest {
+		t.Fatalf("clean = %d urls, want more than the default cap of %d so the submit path has to refuse it", len(clean), maxURLsPerRequest)
 	}
 }
 

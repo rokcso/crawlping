@@ -178,25 +178,55 @@ func TestFilterURLsSentinelRegression(t *testing.T) {
 	}
 }
 
-func TestFilterURLsRejectsOversizedBatchAsTooMany(t *testing.T) {
+func TestSubmitRefusesOversizedBatchAsTooMany(t *testing.T) {
+	// The ceiling is a submission policy, not a property of a URL, so it is
+	// enforced on the way out and reports the number that was configured rather
+	// than a constant. filterURLs leaves an oversized batch intact.
+	urls := buildURLs("example.com", 3)
+
+	engine := newStubEngine(t, http.StatusOK, "")
+	site := stubSite("example.com")
+	result := engine.client().submitWithWindow(site, urls, nil, 2)
+
+	if engine.calls != 0 {
+		t.Fatalf("engine was called %d times for an oversized batch", engine.calls)
+	}
+	if result.Reason != reasonTooMany {
+		t.Fatalf("reason = %q, want %q", result.Reason, reasonTooMany)
+	}
+	if !strings.Contains(result.Detail, fmt.Sprintf("more than %d urls", 2)) {
+		t.Fatalf("detail does not name the configured limit: %q", result.Detail)
+	}
+	if result.EngineStatus != 0 {
+		t.Fatalf("engine status = %d, want 0", result.EngineStatus)
+	}
+	if got := httpStatusFor(result); got != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+	}
+
+	// The same batch fits once the ceiling is raised, which is what makes the
+	// limit a configuration decision rather than a fixed one.
+	engine = newStubEngine(t, http.StatusOK, "")
+	if result := engine.client().submitWithWindow(site, urls, nil, 3); result.Reason != reasonAccepted {
+		t.Fatalf("reason = %q, want accepted at a ceiling of 3", result.Reason)
+	}
+	if engine.calls != 1 {
+		t.Fatalf("engine was called %d times, want 1", engine.calls)
+	}
+}
+
+func TestFilterURLsDoesNotCapTheBatch(t *testing.T) {
+	// Dropping duplicates first is what makes the cap mean "URLs sent". A
+	// thousand repeats of one URL is one URL, and an oversized list is the
+	// submit path's refusal to make, with the configured number in the message.
 	urls := buildURLs("example.com", maxURLsPerRequest+1)
 
 	clean, err := filterURLs("example.com", urls)
-
-	if err == nil {
-		t.Fatalf("expected a refusal, got %d urls", len(clean))
+	if err != nil {
+		t.Fatalf("filterURLs refused an oversized batch: %v", err)
 	}
-	if !errors.Is(err, errTooManyURLs) {
-		t.Fatalf("err = %v, want %v", err, errTooManyURLs)
-	}
-	if !strings.Contains(err.Error(), fmt.Sprintf("more than %d urls", maxURLsPerRequest)) {
-		t.Fatalf("error does not explain the limit: %v", err)
-	}
-	if reason := reasonForURLError(err); reason != reasonTooMany {
-		t.Fatalf("reason = %q, want %q", reason, reasonTooMany)
-	}
-	if got := httpStatusFor(submissionResult{Reason: reasonTooMany}); got != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+	if len(clean) != len(urls) {
+		t.Fatalf("clean = %d urls, want all %d kept", len(clean), len(urls))
 	}
 }
 

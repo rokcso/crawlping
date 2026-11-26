@@ -403,3 +403,98 @@ sites:
 		}
 	}
 }
+
+func TestLoadConfigSubmissionLimits(t *testing.T) {
+	withLimits := func(limits string) string {
+		return fmt.Sprintf(`
+limits:
+%s
+sites:
+  - host: "example.com"
+    indexnow_key: %q
+    token: %q
+`, limits, configTestKey, configTestToken)
+	}
+
+	t.Run("defaults when the block is absent", func(t *testing.T) {
+		cfg, err := loadConfig(writeConfig(t, singleSiteConfig("example.com", configTestKey)))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Limits.MaxURLs != defaultMaxURLs || cfg.Limits.MaxBodyBytes != defaultMaxBodyBytes {
+			t.Fatalf("limits = %+v, want the defaults", cfg.Limits)
+		}
+	})
+
+	t.Run("defaults when the block is empty", func(t *testing.T) {
+		cfg, err := loadConfig(writeConfig(t, withLimits("  max_urls_per_request: 0")))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Limits.MaxURLs != defaultMaxURLs || cfg.Limits.MaxBodyBytes != defaultMaxBodyBytes {
+			t.Fatalf("limits = %+v, want the defaults for the omitted field", cfg.Limits)
+		}
+	})
+
+	t.Run("the protocol ceiling is accepted", func(t *testing.T) {
+		// A site migration is the documented reason to submit this many, so the
+		// largest pair the service allows has to load.
+		cfg, err := loadConfig(writeConfig(t, withLimits(
+			"  max_urls_per_request: 10000\n  max_body_bytes: 2560000",
+		)))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Limits.MaxURLs != 10000 || cfg.Limits.MaxBodyBytes != 2560000 {
+			t.Fatalf("limits = %+v, want what was configured", cfg.Limits)
+		}
+	})
+
+	t.Run("refusals", func(t *testing.T) {
+		cases := map[string]struct {
+			limits string
+			want   string
+		}{
+			"count over the protocol ceiling": {
+				"  max_urls_per_request: 10001\n  max_body_bytes: 2560000",
+				"between 1 and 10000",
+			},
+			"negative count": {
+				"  max_urls_per_request: -1\n  max_body_bytes: 65536",
+				"between 1 and 10000",
+			},
+			"negative body": {
+				"  max_urls_per_request: 10\n  max_body_bytes: -1",
+				"between 1 and 8388608",
+			},
+			"body over the memory ceiling": {
+				"  max_urls_per_request: 10\n  max_body_bytes: 8388609",
+				"between 1 and 8388608",
+			},
+			// The mistake this pair exists to catch: the count is raised and the
+			// body is left behind, so every full batch would be a 413.
+			"count raised without the body": {
+				"  max_urls_per_request: 10000",
+				"which needs at least 160000 bytes",
+			},
+			"count raised with a body still too small": {
+				"  max_urls_per_request: 10000\n  max_body_bytes: 65536",
+				"which needs at least 160000 bytes",
+			},
+		}
+
+		for name, testCase := range cases {
+			t.Run(name, func(t *testing.T) {
+				mustReject(t, withLimits(testCase.limits), testCase.want)
+			})
+		}
+	})
+
+	t.Run("the coupling error says what to set", func(t *testing.T) {
+		// A refused config is only useful if it names the number that works.
+		err := mustReject(t, withLimits("  max_urls_per_request: 10000"), "so 2560000 here")
+		if !strings.Contains(err.Error(), "256 bytes per URL") {
+			t.Fatalf("error does not explain the per-URL sizing: %v", err)
+		}
+	})
+}

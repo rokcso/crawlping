@@ -187,8 +187,9 @@ Every entry has to look like this, or the whole batch is refused:
   a foreign host
 - on the default port only, `443` for https and `80` for http - this instance's
   rule, not IndexNow's, for the reason below
-- at most 100 URLs per request, counted after cleaning (IndexNow allows 10,000
-  per POST; the smaller cap is this instance's own restraint)
+- at most 100 URLs per request by default, counted after cleaning (IndexNow
+  allows 10,000 per POST; `limits.max_urls_per_request` raises this, and the
+  smaller default is this instance's own restraint)
 - within the directory the key file covers, when the key file is not at the
   host root
 - a fragment is stripped before sending, because `#section` marks a place inside
@@ -217,7 +218,8 @@ an engine learns to move or drop an entry it already has. crawlping treats them
 as ordinary URLs on the host - nothing here fetches a URL or checks that it is
 alive - so removing a page is a submission, not an omission.
 
-The body is capped at 65536 bytes (64 KiB), and the cap counts the bytes that
+The body is capped at 65536 bytes (64 KiB) by default - `limits.max_body_bytes`
+raises it - and the cap counts the bytes that
 were actually sent rather than the bytes a JSON decoder happened to stop at: a
 small object followed by megabytes of filler is answered with
 `413 payload_too_large` and a detail naming the limit, not with a syntax error,
@@ -267,6 +269,33 @@ request is answered locally and never reaches the engine.
 These bounds are about how fast this instance spends its own egress IP. The
 resubmission window below is about what it spends its quota on, which is a
 different question.
+
+#### Submission size limits
+
+How much one request may carry is configurable, because the two situations are
+genuinely different:
+
+```yaml
+limits:
+  max_urls_per_request: 100        # 1 to 10000
+  max_body_bytes: 65536            # at least max_urls_per_request * 16, at most 8 MiB
+```
+
+The defaults are what this instance sends when the block is absent, and they are
+far below IndexNow's own 10,000-URL ceiling on purpose: a code path that sends
+hundreds of URLs is usually looping, and a small default makes that visible
+instead of expensive. Raise them for a site migration, which is the documented
+reason to submit a whole site at once.
+
+The two are one decision and are checked together at startup. A body that cannot
+carry `max_urls_per_request` entries makes every full batch a `413`, and nothing
+in the count alone shows that - so a mismatched pair is refused when the config
+loads, with the number to use. Sizing a body at about 256 bytes per URL always
+fits.
+
+Raising the count also grows the resubmission window's table, so one full batch
+is always remembered; a raised count whose URLs the window then forgot would
+resubmit every one of them immediately.
 
 #### The resubmission window
 
@@ -320,12 +349,12 @@ curl -fsS -H "Authorization: Bearer $TOKEN" \
 
 Nothing about the submission changes: the same token, the same validation, the
 same reasons, statuses and log line as the POST form, because it is the same
-code. What the GET cannot do is carry a body, so the 65536 byte cap and the JSON
+code. What the GET cannot do is carry a body, so the body cap and the JSON
 decoder do not apply to it.
 
 The `url` parameter may be repeated to send several URLs in one call
 (`?url=a&url=b`). One is the common case. There is no separate limit for the GET
-form: the 100 URL ceiling and the duplicate collapsing are the same, and the
+form: the URL ceiling and the duplicate collapsing are the same, and the
 request line is bounded by the server's header limit rather than by a body cap.
 
 A request with no `url` parameter at all is `400 bad_request`, exactly as an
@@ -458,14 +487,14 @@ Your caller decides whether to retry.
 | 200 | - | accepted (200 or 202 from IndexNow; a 202 leaves the key `pending`) | no |
 | 400 | `bad_request` | the JSON did not parse, or did not end where the object ended (trailing data), or the body could not be read, or nothing usable survived URL cleaning, or the engine answered 400 | no |
 | 400 | `invalid_url` | an entry is empty, or not an absolute http/https URL | no - fix the caller |
-| 400 | `too_many` | more than 100 URLs in one request | no - split the batch |
+| 400 | `too_many` | more URLs than `limits.max_urls_per_request` allows (100 by default) | no - split the batch |
 | 400 | `non_default_port` | an entry names a port this instance will not send; IndexNow itself sets no port requirement | no - fix the caller |
 | 400 | `out_of_key_scope` | a URL is outside the directory the key file covers | no - move the key file or stop submitting URLs outside its directory |
 | 400 | `engine_rejected` | the engine refused this payload with a status that has no retry rule | no - resending it is pointless |
 | 401 | `unknown_token` | missing or unknown bearer token, on `/submit` or `/health?detail=1` | no |
 | 403 | `key_rejected` | the engine refused the key: missing, mismatched, or its own fetch of the file was blocked; also marks the host `failed` | no - fix the key |
 | 405 | `method_not_allowed` | the method is not GET or POST; `Allow` names the two that work | no |
-| 413 | `payload_too_large` | the body was larger than the 65536 byte limit | no - send fewer URLs |
+| 413 | `payload_too_large` | the body was larger than `limits.max_body_bytes` (65536 by default) | no - send fewer URLs |
 | 422 | `host_mismatch` | a URL was not on the site's own host | no - fix the caller |
 | 429 | `rate_limited` | the engine is throttling this IP; see `Retry-After` | yes, later |
 | 429 | `throttled` | this instance refused to spend any more of its egress IP on this host right now; the engine was not called | yes, after `Retry-After` |

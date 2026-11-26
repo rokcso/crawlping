@@ -8,6 +8,17 @@
 # Same for a Cloudflare Tunnel, where cloudflared shares this network namespace.
 listen: "0.0.0.0:8080"
 
+# Optional: how much one submission may carry. Both defaults are deliberately far
+# below what IndexNow accepts, because a code path that sends hundreds of URLs is
+# usually looping. Raise them together for a site migration, which is the
+# documented reason to submit a whole site at once: IndexNow's own ceiling is
+# 10,000 URLs per request, and a body that carries them needs about 256 bytes per
+# URL. The two are one decision - a body too small for the count makes every full
+# batch a 413 - so a mismatched pair is refused at startup rather than later.
+# limits:
+#   max_urls_per_request: 100        # 1 to 10000
+#   max_body_bytes: 65536            # at least max_urls_per_request * 16, at most 8 MiB
+
 # Optional: which IndexNow endpoint to submit to. The default is the global one,
 # and leaving it alone is right for almost everyone: a submission there is
 # shared with every participating engine, so there is nothing to fan out

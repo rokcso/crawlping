@@ -25,7 +25,8 @@ const (
 	reasonBadRequest = "bad_request"
 	// reasonInvalidURL means one entry is not an absolute http or https URL.
 	reasonInvalidURL = "invalid_url"
-	// reasonTooMany means the batch carried more than maxURLsPerRequest URLs.
+	// reasonTooMany means the batch carried more URLs than the configured
+	// limits.max_urls_per_request allowed.
 	reasonTooMany = "too_many"
 	// reasonNonDefaultPort means one entry names a port this instance will not
 	// forward. This is a local rule, not an IndexNow requirement: neither the
@@ -51,9 +52,11 @@ const (
 	reasonEngineError = "engine_error"
 )
 
-// maxURLsPerRequest keeps a single request small. IndexNow allows 10,000; a
-// code path that sends more than a handful is almost certainly looping.
-const maxURLsPerRequest = 100
+// maxURLsPerRequest keeps a single request small by default. IndexNow allows
+// 10,000; a code path that sends more than a handful is almost certainly
+// looping. It is the default for limits.max_urls_per_request, which is what the
+// submit path actually enforces.
+const maxURLsPerRequest = defaultMaxURLs
 
 // maxEngineDetailBytes bounds how much of an engine error body reaches a log
 // line or an API response. It is deliberately small, which means a body larger
@@ -83,13 +86,16 @@ var (
 
 // Refusals filterURLs can return. Each one is a request problem, so the caller
 // gets a 4xx and an error that names the entry that caused it. They are
-// separate values because the caller has to tell them apart: a too-large batch
-// is not a host problem, and an empty entry is not "no usable urls".
+// separate values because the caller has to tell them apart: an entry outside
+// the key's directory is not a host problem, and an empty entry is not "no
+// usable urls".
+//
+// A too-large batch is not in this set: how many URLs one request may carry is a
+// configured limit rather than a property of a URL, so the submit path refuses
+// it with the configured number in the message.
 var (
 	// errNoURLs means nothing usable was submitted.
 	errNoURLs = errors.New("no usable urls")
-	// errTooManyURLs means the batch is larger than maxURLsPerRequest.
-	errTooManyURLs = fmt.Errorf("more than %d urls", maxURLsPerRequest)
 	// errInvalidURL means an entry is empty or not an absolute http/https URL.
 	errInvalidURL = errors.New("invalid url")
 	// errForeignHost means an entry is not on the site's own host.
@@ -229,7 +235,7 @@ func keyStateAfterCheck(err error) keyState {
 // the engine may already have received. The call therefore gets its own timeout
 // from context.Background and cancels it when it returns.
 func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
-	return c.submitWithWindow(site, urls, nil)
+	return c.submitWithWindow(site, urls, nil, maxURLsPerRequest)
 }
 
 // submitWithWindow is submit with the per-URL resubmission window applied: a URL
@@ -239,7 +245,13 @@ func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 // accepted the batch: every other answer leaves the caller a retry to make, and
 // suppressing that retry would answer 200 "submitted: 0" to a caller whose
 // earlier attempt actually failed.
-func (c *indexNowClient) submitWithWindow(site Site, urls []string, window *submitWindow) submissionResult {
+//
+// maxURLs is the configured ceiling for one request, applied to the cleaned
+// list: duplicates collapse first, so a thousand repeats of one URL still fit.
+// It is a parameter rather than a constant because it is
+// limits.max_urls_per_request, and because it belongs here - how many URLs to
+// send is a decision about sending, not about whether a URL is valid.
+func (c *indexNowClient) submitWithWindow(site Site, urls []string, window *submitWindow, maxURLs int) submissionResult {
 	clean, err := filterURLsInScope(site.Host, site.PathScope, urls)
 	if err != nil {
 		// Locally refused: the engine was never called, so EngineStatus stays
@@ -247,6 +259,13 @@ func (c *indexNowClient) submitWithWindow(site Site, urls []string, window *subm
 		return submissionResult{
 			Reason: reasonForURLError(err),
 			Detail: err.Error(),
+		}
+	}
+
+	if len(clean) > maxURLs {
+		return submissionResult{
+			Reason: reasonTooMany,
+			Detail: fmt.Sprintf("more than %d urls", maxURLs),
 		}
 	}
 
@@ -416,10 +435,6 @@ func filterURLsInScope(host, keyScope string, urls []string) (clean []string, er
 		return nil, errNoURLs
 	}
 
-	if len(clean) > maxURLsPerRequest {
-		return nil, errTooManyURLs
-	}
-
 	return clean, nil
 }
 
@@ -469,8 +484,6 @@ func reasonForURLError(err error) string {
 	switch {
 	case errors.Is(err, errNoURLs):
 		return reasonBadRequest
-	case errors.Is(err, errTooManyURLs):
-		return reasonTooMany
 	case errors.Is(err, errNonDefaultPort):
 		return reasonNonDefaultPort
 	case errors.Is(err, errForeignHost):

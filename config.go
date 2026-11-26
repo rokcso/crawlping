@@ -32,12 +32,49 @@ type Site struct {
 type Config struct {
 	Listen           string `yaml:"listen"`
 	IndexNowEndpoint string `yaml:"indexnow_endpoint"`
+	Limits           Limits `yaml:"limits"`
 	Sites            []Site `yaml:"sites"`
+}
+
+// Limits bounds one submission. They are global rather than per site: a batch is
+// a property of the request, not of the origin it is for.
+//
+// The two are coupled, because a body has to be able to carry the URLs the count
+// allows. Raising the count alone is the obvious mistake - the body cap would
+// answer 413 on the first full batch - so the pair is checked together at
+// startup instead of one of them failing later, per request.
+type Limits struct {
+	MaxURLs      int `yaml:"max_urls_per_request"`
+	MaxBodyBytes int `yaml:"max_body_bytes"`
 }
 
 const (
 	defaultListen   = "127.0.0.1:8080"
 	defaultEndpoint = "https://api.indexnow.org/indexnow"
+
+	// The submission limits. The defaults are deliberately far below what
+	// IndexNow accepts: a code path that sends hundreds of URLs is usually
+	// looping, and a small default makes that visible instead of expensive. The
+	// ceiling is the protocol's own, so a site migration can be pointed at it.
+	defaultMaxURLs      = 100
+	defaultMaxBodyBytes = 64 << 10
+	// specMaxURLsPerRequest is the per-request ceiling IndexNow documents.
+	specMaxURLsPerRequest = 10000
+	// maxBodyBytesCeiling bounds what one body may claim. Up to
+	// maxInFlightEngineCalls bodies are held at once, so this is also the
+	// worst-case memory a caller can make this process hold.
+	maxBodyBytesCeiling = 8 << 20
+	// minJSONBytesPerURL is the smallest one urlList entry can be: two quote
+	// marks and the separating comma, before any characters of the URL itself.
+	// A body cap below maxURLs*this can never carry a full batch, whatever the
+	// URLs are, which is the mistake this catches.
+	minJSONBytesPerURL = 16
+	// planningBytesPerURL is what to size a body for in practice: a realistic
+	// URL plus its quotes, comma and the surrounding JSON. It only appears in
+	// the error message, so the number a rejected config is told to use is one
+	// that will actually work.
+	planningBytesPerURL = 256
+
 	// 16 hex chars is the floor we accept for a bearer token. Anything shorter
 	// is almost certainly a placeholder that was never replaced.
 	minTokenLength = 16
@@ -82,6 +119,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.IndexNowEndpoint == "" {
 		cfg.IndexNowEndpoint = defaultEndpoint
+	}
+	if err := cfg.Limits.applyDefaults(); err != nil {
+		return nil, err
 	}
 	if len(cfg.Sites) == 0 {
 		return nil, fmt.Errorf("config lists no sites")
@@ -156,6 +196,43 @@ func loadConfig(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// applyDefaults fills in the submission limits and refuses a pair that cannot
+// work. A zero value means "not set" and takes the default, which is what an
+// omitted limits block decodes to.
+func (l *Limits) applyDefaults() error {
+	if l.MaxURLs == 0 {
+		l.MaxURLs = defaultMaxURLs
+	}
+	if l.MaxBodyBytes == 0 {
+		l.MaxBodyBytes = defaultMaxBodyBytes
+	}
+
+	if l.MaxURLs < 1 || l.MaxURLs > specMaxURLsPerRequest {
+		return fmt.Errorf(
+			"limits.max_urls_per_request is %d; it has to be between 1 and %d, the ceiling IndexNow documents",
+			l.MaxURLs, specMaxURLsPerRequest,
+		)
+	}
+	if l.MaxBodyBytes < 1 || l.MaxBodyBytes > maxBodyBytesCeiling {
+		return fmt.Errorf(
+			"limits.max_body_bytes is %d; it has to be between 1 and %d",
+			l.MaxBodyBytes, maxBodyBytesCeiling,
+		)
+	}
+
+	// The two are one decision: a body that cannot carry maxURLs entries makes
+	// every full batch a 413, and the caller has no way to see that from the
+	// count alone.
+	if least := l.MaxURLs * minJSONBytesPerURL; l.MaxBodyBytes < least {
+		return fmt.Errorf(
+			"limits.max_body_bytes is %d but max_urls_per_request is %d, which needs at least %d bytes even for bare URLs; size it at about %d bytes per URL, so %d here",
+			l.MaxBodyBytes, l.MaxURLs, least, planningBytesPerURL, l.MaxURLs*planningBytesPerURL,
+		)
+	}
+
+	return nil
 }
 
 // normalizeHost accepts a bare DNS hostname and returns it lowercased. Anything

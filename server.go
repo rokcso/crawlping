@@ -16,9 +16,11 @@ import (
 	"time"
 )
 
-// maxBodyBytes bounds a submission body. 100 URLs fit far below this; anything
-// larger is a mistake or an attempt to make the process allocate.
-const maxBodyBytes = 64 << 10
+// maxBodyBytes is the default submission body bound, used when the config does
+// not set limits.max_body_bytes. The effective bound is server.maxBodyBytes,
+// which comes from the config: the two limits move together, and loadConfig
+// refuses a pair where the body could not carry the URL count.
+const maxBodyBytes = defaultMaxBodyBytes
 
 // verifyTimeout bounds one key-file check, so a slow origin cannot hold the
 // background check open indefinitely.
@@ -171,12 +173,38 @@ type server struct {
 	// dropped from the batch before the request is built, because every
 	// submitted URL spends crawl quota whether or not the engine already had it.
 	window *submitWindow
+	// maxURLs and maxBodyBytes are the effective submission limits. They are
+	// fields rather than reads of cfg.Limits because a Config built without
+	// loadConfig has zero values, and those have to mean the default here too -
+	// otherwise a zero body cap would answer 413 to every request.
+	maxURLs      int
+	maxBodyBytes int
 	// recheckTimeout bounds one ?recheck=1, and is a field so a test can spend
 	// a few milliseconds instead of five seconds.
 	recheckTimeout time.Duration
 }
 
 func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
+	// Zero means "not set", the same rule the file follows, so a Config built by
+	// hand (a test, or any caller that did not come through loadConfig) takes the
+	// defaults instead of answering 413 to everything.
+	maxURLs, maxBodyBytes := cfg.Limits.MaxURLs, cfg.Limits.MaxBodyBytes
+	if maxURLs == 0 {
+		maxURLs = defaultMaxURLs
+	}
+	if maxBodyBytes == 0 {
+		maxBodyBytes = defaultMaxBodyBytes
+	}
+
+	// The window has to be able to remember one full batch, or a raised
+	// max_urls_per_request would send URLs it then silently forgets, and every
+	// one of them would be resubmitted immediately. Its own cap still applies on
+	// top, as the bound on arbitrary input.
+	tracked := maxTrackedURLs
+	if maxURLs > tracked {
+		tracked = maxURLs
+	}
+
 	return &server{
 		cfg:            cfg,
 		client:         client,
@@ -184,7 +212,9 @@ func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
 		keyStates:      make(map[string]keyRecord, len(cfg.Sites)),
 		rate:           newRateBucket(rateBurstTokens, rateRefillInterval),
 		inflight:       newInflightGuard(maxInFlightEngineCalls),
-		window:         newSubmitWindow(resubmitWindow, maxTrackedURLs),
+		window:         newSubmitWindow(resubmitWindow, tracked),
+		maxURLs:        maxURLs,
+		maxBodyBytes:   maxBodyBytes,
 		recheckTimeout: recheckTimeout,
 	}
 }
@@ -601,7 +631,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	// only early warning this tool can give: the engine's limit is not
 	// published, so the trend is the signal.
 	start := time.Now()
-	result := s.client.submitWithWindow(*site, urls, s.window)
+	result := s.client.submitWithWindow(*site, urls, s.window, s.maxURLs)
 	duration := time.Since(start)
 
 	// Record a key verdict only when the submission produced one. A 200 proves
@@ -681,7 +711,7 @@ func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, site *Site)
 	// MaxBytesReader has nothing to refuse. Reading all of it applies the cap
 	// to the bytes that were actually sent, and json.Unmarshal then rejects
 	// anything left over after the value.
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, int64(s.maxBodyBytes))
 
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -699,7 +729,7 @@ func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, site *Site)
 				Host:   site.Host,
 				Status: http.StatusRequestEntityTooLarge,
 				Reason: reasonPayloadTooLarge,
-				Detail: fmt.Sprintf("body exceeded the %d byte limit", maxBodyBytes),
+				Detail: fmt.Sprintf("body exceeded the %d byte limit", s.maxBodyBytes),
 			})
 			return nil, false
 		}

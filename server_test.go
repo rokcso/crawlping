@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1788,5 +1789,70 @@ func TestSubmitLogsSkipped(t *testing.T) {
 
 	if !strings.Contains(lines.String(), "skipped=1") {
 		t.Fatalf("submit log does not say what the window dropped: %s", lines.String())
+	}
+}
+
+func TestSubmitCarriesARaisedCeilingEndToEnd(t *testing.T) {
+	// The documented reason to submit a lot at once is a site migration, and the
+	// point of making the limits configurable is that such a batch gets through
+	// instead of being refused at 100. This drives the real handler, so it also
+	// pins that the body cap moved with the count: 400 realistic URLs is well
+	// past 64 KiB, so a body cap left at the old default would answer 413 here.
+	const count = 400
+	urls := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		urls = append(urls, fmt.Sprintf("https://example.com/2026/11/a-rather-long-article-slug-number-%03d?utm_source=%s", i, strings.Repeat("x", 160)))
+	}
+
+	body, err := json.Marshal(map[string]any{"urls": urls})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(body) <= maxBodyBytes {
+		t.Fatalf("the fixture is %d bytes, which does not exceed the default cap; it proves nothing", len(body))
+	}
+
+	engine := newFakeEngine(t, http.StatusOK)
+	cfg := &Config{
+		Listen: "127.0.0.1:0",
+		Limits: Limits{MaxURLs: count, MaxBodyBytes: 1 << 20},
+		Sites: []Site{{
+			Host:        "example.com",
+			IndexNowKey: "abc123def456",
+			KeyLocation: "https://example.com/abc123def456.txt",
+			Token:       testToken,
+		}},
+	}
+	srv := newServer(cfg, newIndexNowClient(engine.server.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	recorder, decoded := post(t, srv, string(body), "Bearer "+testToken)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if decoded["submitted"] != float64(count) {
+		t.Fatalf("submitted = %v, want %d", decoded["submitted"], count)
+	}
+	if len(engine.gotURLs) != count {
+		t.Fatalf("engine received %d urls, want %d", len(engine.gotURLs), count)
+	}
+
+	// And the same body is still refused when the ceiling is left at the default,
+	// which is what makes the two settings one decision.
+	engine = newFakeEngine(t, http.StatusOK)
+	srv = newServer(&Config{
+		Listen: "127.0.0.1:0",
+		Sites:  cfg.Sites,
+	}, newIndexNowClient(engine.server.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	recorder, decoded = post(t, srv, string(body), "Bearer "+testToken)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d at the default limits, want 413", recorder.Code)
+	}
+	if decoded["reason"] != reasonPayloadTooLarge {
+		t.Fatalf("reason = %v, want %q", decoded["reason"], reasonPayloadTooLarge)
+	}
+	if engine.gotCalls != 0 {
+		t.Fatalf("engine was called %d times for an oversized body", engine.gotCalls)
 	}
 }
