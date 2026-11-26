@@ -221,6 +221,10 @@ and it is absent whenever the engine was never called - `throttled`,
 `overloaded`, `payload_too_large` and every other local refusal leave it out,
 because reporting a status no engine ever returned would be an invention.
 
+`submitted` counts the URLs that went to the engine in this request. `skipped`
+counts the ones the resubmission window dropped, is absent when it is zero, and
+is not a reason: see the resubmission window below.
+
 The two fields together answer a question one of them cannot: a `422` with
 `"reason": "host_mismatch"` and `"engine_status": 422` is the engine refusing
 what you sent, while the same `422` with no `engine_status` is this instance
@@ -244,17 +248,40 @@ operator's IP into the engine's throttle - which would break the legitimate
 submissions too, and is the exact harm this tool exists to avoid. A refused
 request is answered locally and never reaches the engine.
 
-These bounds are about how fast this instance spends its own egress IP. They say
-nothing about whether a URL has already been sent, and they will not stop you
-submitting one again. crawlping keeps no per-URL state: no history, no debounce,
-no record that a URL was sent before. Deduplication across requests and the
-resubmission interval are the caller's job, and IndexNow is explicit about both:
-do not resubmit a URL that has not changed, wait at least 5 minutes before
-resubmitting the same URL (10 in another part of the same documentation), and
-assume every submitted URL spends crawl quota whether or not the engine already
-had it. The only deduplication inside crawlping is within a single request,
-where duplicates collapse before sending. A `200` means the batch was received;
-resubmitting on a timer is not a faster route to being crawled.
+These bounds are about how fast this instance spends its own egress IP. The
+resubmission window below is about what it spends its quota on, which is a
+different question.
+
+#### The resubmission window
+
+A URL sent less than 5 minutes ago is dropped from the batch before the request
+is built, and counted in `skipped` instead of `submitted`. IndexNow asks for
+this: do not resubmit a URL that has not changed, and wait at least 5 minutes
+before resubmitting the same one (10 in another part of the same documentation -
+5 is used here, because the window exists to stop a retry loop from burning
+quota, not to police how often a page may change). Every submitted URL spends
+crawl quota whether or not the engine already had it, so a caller polling on a
+timer was previously paying for each poll.
+
+- The window is per site host and per URL, keyed on the URL that was actually
+sent, after cleaning: fragments stripped, duplicates collapsed. One site cannot
+suppress another's URL.
+- A URL is remembered only when the engine accepted the batch that carried it. A
+failed submission leaves you a retry to make, and that retry is not suppressed.
+- A batch in which everything is inside the window is **not** an error: 200,
+`ok: true`, `submitted: 0`, `skipped: n`, and no `reason`. The engine is not
+called.
+- The table is bounded (4096 URLs of up to 2048 bytes each) so a caller cannot
+grow this process's memory with arbitrary URLs. Past that the oldest entry is
+forgotten, which costs at most one early resubmission.
+
+The window is a quota guard, not a scheduler: it never sends anything later on
+your behalf, and it does not decide whether a page changed. Deduplication inside
+one request still happens for every caller; this adds the same thing across
+requests, for five minutes.
+
+A `200` means the batch was received. Resubmitting on a timer is still not a
+faster route to being crawled.
 
 There are two different `429`s and they are worth telling apart:
 
@@ -265,6 +292,32 @@ There are two different `429`s and they are worth telling apart:
 
 Both carry `Retry-After` and `retry_after_seconds`. Only the second one means
 the operator's IP is being penalised; the first one is the guard doing its job.
+
+### `GET /submit`
+
+IndexNow's own single-URL form, for citing one page from a shell:
+
+```bash
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "https://crawlping.example.net/submit?url=https%3A%2F%2Fexample.com%2Fblog%2Fnew-post"
+```
+
+Nothing about the submission changes: the same token, the same validation, the
+same reasons, statuses and log line as the POST form, because it is the same
+code. What the GET cannot do is carry a body, so the 65536 byte cap and the JSON
+decoder do not apply to it.
+
+The `url` parameter may be repeated to send several URLs in one call
+(`?url=a&url=b`). One is the common case. There is no separate limit for the GET
+form: the 100 URL ceiling and the duplicate collapsing are the same, and the
+request line is bounded by the server's header limit rather than by a body cap.
+
+A request with no `url` parameter at all is `400 bad_request`, exactly as an
+empty `urls` list is on the POST form.
+
+`GET /submit` answers, and so does `POST /submit`. Any other method gets `405`
+with `Allow: GET, POST`. There is no `HEAD`: a HEAD would have to submit
+something to be honest, and a HEAD is not supposed to have side effects.
 
 ### `GET /health`
 
@@ -387,6 +440,7 @@ Your caller decides whether to retry.
 | 400 | `engine_rejected` | the engine refused this payload with a status that has no retry rule | no - resending it is pointless |
 | 401 | `unknown_token` | missing or unknown bearer token, on `/submit` or `/health?detail=1` | no |
 | 403 | `key_rejected` | the engine did not accept the key file; also marks the host `failed` | no - fix the key |
+| 405 | `method_not_allowed` | the method is not GET or POST; `Allow` names the two that work | no |
 | 413 | `payload_too_large` | the body was larger than the 65536 byte limit | no - send fewer URLs |
 | 422 | `host_mismatch` | a URL was not on the site's own host | no - fix the caller |
 | 429 | `rate_limited` | the engine is throttling this IP; see `Retry-After` | yes, later |
@@ -400,6 +454,9 @@ read carefully: the engine understood the payload and refused it, so retrying is
 pointless until the payload changes. An oversized body is reported as
 `payload_too_large` rather than as `bad_request`, because the JSON may be valid
 and only too large.
+
+A batch the resubmission window emptied is not in this table because it is not a
+refusal: it is a `200` with `ok: true`, `submitted: 0` and `skipped: n`.
 
 Two `429`s, two meanings. `throttled` is this instance protecting its own egress
 IP, so nothing was sent and the engine never saw the request; `rate_limited` is
@@ -441,9 +498,10 @@ if (res.status === 429 || res.status === 503) {
 - No sitemap watching or diffing. You send the URLs you changed.
 - No retry loop. `429`, `502` and `503` are reported so your code can decide;
 the instance only bounds how much it will spend on your behalf.
-- No per-URL memory and no resubmission debounce. Only a single request is
-  deduplicated, so the interval between submissions of the same URL is yours to
-  enforce.
+- No per-URL memory beyond the five-minute resubmission window. The window
+  remembers that a URL was sent recently, per host; it holds no history, keeps no
+  record of what the engine did with it, and never schedules anything. Dedupe
+  inside a single request still happens for every caller.
 - No database, no UI, no accounts.
 - No Google. Google's Indexing API accepts only `JobPosting` and
   `BroadcastEvent`, so no tool can submit ordinary pages to Google.

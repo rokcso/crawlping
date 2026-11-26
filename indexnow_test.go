@@ -584,6 +584,7 @@ func TestHTTPStatusForMapsEveryReason(t *testing.T) {
 		reasonRateLimited:      http.StatusTooManyRequests,
 		reasonThrottled:        http.StatusTooManyRequests,
 		reasonOverloaded:       http.StatusServiceUnavailable,
+		reasonMethodNotAllowed: http.StatusMethodNotAllowed,
 		reasonEngineError:      http.StatusBadGateway,
 		"a_reason_added_later": http.StatusBadGateway,
 	}
