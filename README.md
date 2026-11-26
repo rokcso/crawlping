@@ -364,7 +364,7 @@ and one is the absence of a fact, which is why there are not two.
 
 | State | What it means | What sets it |
 |---|---|---|
-| `verified` | the key is known to work | the key file was fetched and matched, or a submission was accepted with engine `200` |
+| `verified` | this instance's best evidence that the key works | the key file was fetched from here and matched, or a submission was accepted with engine `200` |
 | `pending` | nothing is known yet | not checked yet, a check still running, a check cancelled or timed out, an unreachable origin, or the engine answered `202` ("received, key validation pending") |
 | `failed` | the key is known not to work | the key file was fetched and definitively rejected (non-2xx status, unreadable body, or body mismatch), or the engine answered `403` |
 
@@ -373,6 +373,14 @@ failures. A check that reached no answer learned nothing, so it records `pending
 - or leaves the state alone when the process is shutting down - instead of
 blaming a key file nobody managed to read. Only a definitive rejection is
 `failed`.
+
+`verified` is deliberately worded as evidence rather than as proof, because the
+two ways of reaching it are not equally strong. A submission the engine answered
+`200` is its own verdict. A key file that matched when this instance fetched it
+only says the file is correct and reachable **from here**; the engine fetches it
+from somewhere else, so a bot filter or a country rule can still turn that into
+`403` on the next submission. See [Check it before trusting
+it](#check-it-before-trusting-it).
 
 An engine error or a rate limit says nothing about the key and leaves the state
 as it was. A host that is `failed` recovers by itself: the next accepted
@@ -402,7 +410,7 @@ Your caller decides whether to retry.
 | 400 | `out_of_key_scope` | a URL is outside the directory the key file covers | no - move the key file or stop submitting URLs outside its directory |
 | 400 | `engine_rejected` | the engine refused this payload with a status that has no retry rule | no - resending it is pointless |
 | 401 | `unknown_token` | missing or unknown bearer token, on `/submit` or `/health?detail=1` | no |
-| 403 | `key_rejected` | the engine did not accept the key file; also marks the host `failed` | no - fix the key |
+| 403 | `key_rejected` | the engine refused the key: missing, mismatched, or its own fetch of the file was blocked; also marks the host `failed` | no - fix the key |
 | 413 | `payload_too_large` | the body was larger than the 65536 byte limit | no - send fewer URLs |
 | 422 | `host_mismatch` | a URL was not on the site's own host | no - fix the caller |
 | 429 | `rate_limited` | the engine is throttling this IP; see `Retry-After` | yes, later |
