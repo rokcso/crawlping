@@ -64,10 +64,16 @@ func usageText() string {
 Usage:
   crawlping serve        [-config path]   run the HTTP API
   crawlping check        [-config path]   verify every configured key file
-  crawlping healthcheck  [-config path]   exit 0 when the local API answers
+  crawlping healthcheck  [-addr host:port] [-config path]
+                                          exit 0 when the local API answers
   crawlping version
 
 The config path defaults to $%s, then ./config.yaml.
+
+healthcheck precedence: -addr wins when it is given. The address is dialed as
+is and the config file is never read, so a healthcheck still describes the
+running process after someone edits config.yaml underneath it. Without -addr
+the listen address comes from the config file.
 `, version, configEnv)
 }
 
@@ -181,15 +187,26 @@ func cmdCheck(args []string) error {
 }
 
 func cmdHealthcheck(args []string) error {
-	configPath := configFlag("healthcheck", args)
+	flags := flag.NewFlagSet("healthcheck", flag.ExitOnError)
+	addr := flags.String("addr", "", "host:port to probe directly; the config file is not read")
+	configPath := flags.String("config", defaultConfigPath(), "path to config.yaml")
+	_ = flags.Parse(args)
 
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		return err
+	// serve reads the config once, at startup. Parsing it here would let the
+	// probe drift away from the process it is supposed to describe: an edit to
+	// the mounted file changes what this healthcheck looks at, not what the
+	// server is listening on. -addr is the way out of that.
+	listen := *addr
+	if listen == "" {
+		cfg, err := loadConfig(*configPath)
+		if err != nil {
+			return err
+		}
+		listen = cfg.Listen
 	}
 
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(localHealthURL(cfg.Listen))
+	resp, err := client.Get(localHealthURL(listen))
 	if err != nil {
 		return err
 	}
