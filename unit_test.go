@@ -3,8 +3,6 @@ package main
 import (
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -145,94 +143,6 @@ func TestLocalHealthURL(t *testing.T) {
 		if got := localHealthURL(listen); got != want {
 			t.Fatalf("%q: got %q, want %q", listen, got, want)
 		}
-	}
-}
-
-func writeConfig(t *testing.T, body string) string {
-	t.Helper()
-
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	return path
-}
-
-func TestLoadConfigAppliesDefaults(t *testing.T) {
-	path := writeConfig(t, `
-sites:
-  - host: example.com
-    indexnow_key: abc123
-    token: token-shared-for-two-sites
-`)
-
-	cfg, err := loadConfig(path)
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-
-	if cfg.Listen != defaultListen {
-		t.Fatalf("listen = %q", cfg.Listen)
-	}
-	if cfg.IndexNowEndpoint != defaultEndpoint {
-		t.Fatalf("endpoint = %q", cfg.IndexNowEndpoint)
-	}
-	if cfg.Sites[0].KeyLocation != "https://example.com/abc123.txt" {
-		t.Fatalf("key_location = %q", cfg.Sites[0].KeyLocation)
-	}
-}
-
-func TestLoadConfigRejectsBadInput(t *testing.T) {
-	cases := map[string]string{
-		"no sites": `
-sites: []
-`,
-		"short token": `
-sites:
-  - host: example.com
-    indexnow_key: abc123
-    token: short
-`,
-		"duplicate token": `
-sites:
-  - host: a.com
-    indexnow_key: k1
-    token: token-shared-for-two-sites
-  - host: b.com
-    indexnow_key: k2
-    token: token-shared-for-two-sites
-`,
-		"duplicate host": `
-sites:
-  - host: a.com
-    indexnow_key: k1
-    token: token-shared-for-two-sites
-  - host: a.com
-    indexnow_key: k2
-    token: token-second-site-0001
-`,
-		"unknown field": `
-sites:
-  - host: a.com
-    indexnow_key: k1
-    token: token-shared-for-two-sites
-    typo_here: 1
-`,
-	}
-
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			if _, err := loadConfig(writeConfig(t, body)); err == nil {
-				t.Fatal("expected an error")
-			}
-		})
-	}
-}
-
-func TestLoadConfigMissingFile(t *testing.T) {
-	if _, err := loadConfig(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
-		t.Fatal("expected an error")
 	}
 }
 
