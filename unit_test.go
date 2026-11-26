@@ -56,17 +56,17 @@ func TestFilterURLs(t *testing.T) {
 
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			clean, offending := filterURLs(testCase.host, testCase.urls)
+			clean, err := filterURLs(testCase.host, testCase.urls)
 
 			if testCase.wantBad {
-				if offending == "" {
+				if err == nil {
 					t.Fatalf("expected the batch to be refused, got %v", clean)
 				}
 				return
 			}
 
-			if offending != "" {
-				t.Fatalf("unexpected refusal: %q", offending)
+			if err != nil {
+				t.Fatalf("unexpected refusal: %v", err)
 			}
 			if len(clean) != testCase.wantClean {
 				t.Fatalf("clean = %d urls, want %d", len(clean), testCase.wantClean)
@@ -81,7 +81,7 @@ func TestFilterURLsCapsBatchSize(t *testing.T) {
 		urls = append(urls, fmt.Sprintf("https://example.com/page-%d", i))
 	}
 
-	if _, offending := filterURLs("example.com", urls); offending == "" {
+	if _, err := filterURLs("example.com", urls); err == nil {
 		t.Fatal("expected an oversized batch to be refused")
 	}
 }

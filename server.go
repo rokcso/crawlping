@@ -48,7 +48,10 @@ type submitRequest struct {
 }
 
 type submitResponse struct {
-	OK        bool   `json:"ok"`
+	OK bool `json:"ok"`
+	// Status is the HTTP status of this response. A locally refused batch was
+	// never sent to the engine, so putting an engine status here would be a
+	// status no engine ever returned.
 	Status    int    `json:"status"`
 	Host      string `json:"host,omitempty"`
 	Submitted int    `json:"submitted"`
@@ -105,7 +108,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	s.log.Info("submit",
 		"host", site.Host,
-		"engine_status", result.Status,
+		"engine_status", result.EngineStatus,
 		"http_status", status,
 		"submitted", result.Submitted,
 		"reason", result.Reason,
@@ -113,7 +116,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, status, submitResponse{
 		OK:                result.accepted(),
-		Status:            result.Status,
+		Status:            status,
 		Host:              site.Host,
 		Submitted:         result.Submitted,
 		Reason:            result.Reason,
@@ -173,7 +176,9 @@ func httpStatusFor(result submissionResult) int {
 	switch result.Reason {
 	case reasonAccepted:
 		return http.StatusOK
-	case reasonBadRequest:
+	case reasonBadRequest, reasonInvalidURL, reasonTooMany, reasonNonDefaultPort, reasonEngineRejected:
+		// The request will be refused identically if it is sent again, so it is
+		// a client error, not a host problem and not a retryable one.
 		return http.StatusBadRequest
 	case reasonKeyRejected:
 		return http.StatusForbidden
@@ -182,8 +187,8 @@ func httpStatusFor(result submissionResult) int {
 	case reasonRateLimited:
 		return http.StatusTooManyRequests
 	default:
-		// The engine failed or the request never landed; the caller should
-		// treat it as "try again later".
+		// engine_error and anything unrecognised: the engine failed or the
+		// request never landed, so the caller should try again later.
 		return http.StatusBadGateway
 	}
 }
