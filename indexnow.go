@@ -112,6 +112,9 @@ type submissionResult struct {
 	RetryAfter time.Duration
 	Detail     string
 	Submitted  int
+	// Skipped counts the URLs the resubmission window dropped before the request
+	// was built. They were not sent, so they are not in Submitted.
+	Skipped int
 }
 
 func (r submissionResult) accepted() bool {
@@ -215,7 +218,10 @@ func keyStateAfterCheck(err error) keyState {
 	}
 }
 
-// submit posts the batch and translates the engine's status into a reason.
+// submit posts the batch and translates the engine's status into a reason. It
+// applies no resubmission window, which is what a caller that tracks nothing
+// needs: it is submitWithWindow with no window, so a caller that has no window
+// to honour stays a two-argument call.
 //
 // It takes no caller context on purpose. The URL set is already decided by the
 // time this runs, so the caller's patience cannot change the outcome - and
@@ -223,6 +229,17 @@ func keyStateAfterCheck(err error) keyState {
 // the engine may already have received. The call therefore gets its own timeout
 // from context.Background and cancels it when it returns.
 func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
+	return c.submitWithWindow(site, urls, nil)
+}
+
+// submitWithWindow is submit with the per-URL resubmission window applied: a URL
+// the window still remembers is dropped before the request is built, so a caller
+// retrying on a timer does not spend crawl quota on a URL that was already
+// announced. The URLs that did go out are remembered only when the engine
+// accepted the batch: every other answer leaves the caller a retry to make, and
+// suppressing that retry would answer 200 "submitted: 0" to a caller whose
+// earlier attempt actually failed.
+func (c *indexNowClient) submitWithWindow(site Site, urls []string, window *submitWindow) submissionResult {
 	clean, err := filterURLsInScope(site.Host, site.PathScope, urls)
 	if err != nil {
 		// Locally refused: the engine was never called, so EngineStatus stays
@@ -233,6 +250,19 @@ func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 		}
 	}
 
+	skipped := 0
+	if window != nil {
+		clean, skipped = window.keep(site.Host, clean)
+		if len(clean) == 0 {
+			// Everything in the batch was sent inside the window. That is not a
+			// failure and not a refusal: the caller asked for something that is
+			// already true. Nothing is built and no engine is called, so the
+			// result carries no status, no reason and nothing recorded - recording
+			// here would let a suppressed URL extend its own window forever.
+			return submissionResult{Skipped: skipped}
+		}
+	}
+
 	payload, err := json.Marshal(map[string]any{
 		"host":        site.Host,
 		"key":         site.IndexNowKey,
@@ -240,7 +270,7 @@ func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 		"urlList":     clean,
 	})
 	if err != nil {
-		return submissionResult{Reason: reasonEngineError, Detail: err.Error()}
+		return submissionResult{Reason: reasonEngineError, Detail: err.Error(), Skipped: skipped}
 	}
 
 	reqCtx, cancel := context.WithTimeout(context.Background(), engineTimeout)
@@ -248,7 +278,7 @@ func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return submissionResult{Reason: reasonEngineError, Detail: err.Error()}
+		return submissionResult{Reason: reasonEngineError, Detail: err.Error(), Skipped: skipped}
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
@@ -256,11 +286,11 @@ func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 	if err != nil {
 		// Never landed. Distinct from an engine verdict, which is why
 		// EngineStatus stays 0.
-		return submissionResult{Reason: reasonEngineError, Detail: err.Error()}
+		return submissionResult{Reason: reasonEngineError, Detail: err.Error(), Skipped: skipped}
 	}
 	defer resp.Body.Close()
 
-	result := submissionResult{EngineStatus: resp.StatusCode}
+	result := submissionResult{EngineStatus: resp.StatusCode, Skipped: skipped}
 
 	switch {
 	case resp.StatusCode == http.StatusOK, resp.StatusCode == http.StatusAccepted:
@@ -291,6 +321,15 @@ func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxEngineDetailBytes))
 	if !result.accepted() {
 		result.Detail = summarizeEngineBody(body)
+		return result
+	}
+
+	// Only an accepted batch (200 or 202) proves the URLs were taken, so only
+	// then are they remembered. A refusal, a rate limit or an engine error leaves
+	// the caller something to do, and the caller's retry is what the next
+	// submission is for.
+	if window != nil {
+		window.record(site.Host, clean)
 	}
 
 	return result

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -133,6 +134,49 @@ func post(t *testing.T, srv *server, body string, authorization string) (*httpte
 	t.Helper()
 
 	req := httptest.NewRequest(http.MethodPost, "/submit", strings.NewReader(body))
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+
+	recorder := httptest.NewRecorder()
+	srv.routes().ServeHTTP(recorder, req)
+
+	var decoded map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &decoded)
+
+	return recorder, decoded
+}
+
+// postURL posts one batch carrying exactly these URLs, so a test that cares
+// about which URLs it sent does not hand-write JSON.
+func postURL(t *testing.T, srv *server, authorization string, urls ...string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+
+	body, err := json.Marshal(submitRequest{URLs: urls})
+	if err != nil {
+		t.Fatalf("marshal batch: %v", err)
+	}
+
+	return post(t, srv, string(body), authorization)
+}
+
+// submitQuery builds the GET form of a submission: one url parameter per URL,
+// escaped the way a shell would have to escape it.
+func submitQuery(urls ...string) string {
+	values := make(url.Values, 1)
+	for _, u := range urls {
+		values.Add("url", u)
+	}
+
+	return values.Encode()
+}
+
+// getSubmit performs one GET /submit, which carries the URL list in the query
+// string instead of a body.
+func getSubmit(t *testing.T, srv *server, query string, authorization string) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "/submit?"+query, nil)
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
@@ -349,6 +393,140 @@ func TestSubmitRejectsMalformedBody(t *testing.T) {
 	}
 	if body["reason"] != reasonBadRequest {
 		t.Fatalf("reason = %v", body["reason"])
+	}
+}
+
+// --- GET, IndexNow's own single-URL form ------------------------------------
+
+func TestSubmitGETForwardsTheURL(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	recorder, body := getSubmit(t, srv, submitQuery("https://example.com/blog/new-post"), "Bearer "+testToken)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["ok"] != true || body["submitted"] != float64(1) {
+		t.Fatalf("unexpected body: %v", body)
+	}
+	if got := engine.urls(); len(got) != 1 || got[0] != "https://example.com/blog/new-post" {
+		t.Fatalf("engine received %v, want the one url", got)
+	}
+	if engine.host() != "example.com" {
+		t.Fatalf("engine host = %q", engine.host())
+	}
+}
+
+func TestSubmitGETRejectsUnknownToken(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	for _, authorization := range []string{"", "Bearer wrong", "Basic " + testToken} {
+		recorder, body := getSubmit(t, srv, submitQuery("https://example.com/a"), authorization)
+
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%q: status = %d, want 401", authorization, recorder.Code)
+		}
+		if body["reason"] != reasonUnknownToken {
+			t.Fatalf("%q: reason = %v", authorization, body["reason"])
+		}
+	}
+
+	if got := engine.calls(); got != 0 {
+		t.Fatalf("engine was called %d times for rejected requests", got)
+	}
+}
+
+func TestSubmitGETRejectsForeignHostWithoutCallingEngine(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	recorder, body := getSubmit(t, srv, submitQuery("https://attacker.test/b"), "Bearer "+testToken)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["reason"] != reasonHostMismatch {
+		t.Fatalf("reason = %v, want %q", body["reason"], reasonHostMismatch)
+	}
+	if got := engine.calls(); got != 0 {
+		t.Fatalf("engine was called %d times for a rejected url", got)
+	}
+}
+
+func TestSubmitGETWithoutAnURLIsBadRequest(t *testing.T) {
+	// Nothing to submit is the same answer on both methods: the empty list is
+	// refused by the submission path, not by the method that carried it.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	recorder, body := getSubmit(t, srv, "", "Bearer "+testToken)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["reason"] != reasonBadRequest {
+		t.Fatalf("reason = %v, want %q", body["reason"], reasonBadRequest)
+	}
+	if got := engine.calls(); got != 0 {
+		t.Fatalf("engine was called %d times for an empty batch", got)
+	}
+}
+
+func TestSubmitGETSubmitsEveryRepeatedURL(t *testing.T) {
+	// One url parameter is the common case, but the repeated form is what makes
+	// a small batch a single call, so it has to carry all of them - and go
+	// through the same duplicate collapsing as the JSON form.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	recorder, body := getSubmit(t, srv,
+		submitQuery("https://example.com/a", "https://example.com/b", "https://example.com/a"),
+		"Bearer "+testToken,
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["submitted"] != float64(2) {
+		t.Fatalf("submitted = %v, want 2", body["submitted"])
+	}
+	if got := engine.urls(); len(got) != 2 {
+		t.Fatalf("engine received %d urls, want 2: %v", len(got), got)
+	}
+}
+
+func TestSubmitUnsupportedMethodAnswers405(t *testing.T) {
+	// /submit is registered on the path rather than per method, so a HEAD would
+	// reach the handler and the Allow header is the handler's own: it must name
+	// both methods that work and nothing else.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodHead} {
+		req := httptest.NewRequest(method, "/submit", strings.NewReader(`{"urls":["https://example.com/a"]}`))
+		recorder := httptest.NewRecorder()
+		srv.routes().ServeHTTP(recorder, req)
+
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s: status = %d, want 405 (%s)", method, recorder.Code, recorder.Body.String())
+		}
+		if got := recorder.Header().Get("Allow"); got != "GET, POST" {
+			t.Fatalf("%s: Allow = %q, want %q", method, got, "GET, POST")
+		}
+
+		var body submitResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s: decode: %v", method, err)
+		}
+		if body.OK || body.Status != http.StatusMethodNotAllowed || body.Reason != reasonMethodNotAllowed {
+			t.Fatalf("%s: unexpected refusal: %+v", method, body)
+		}
+	}
+
+	if got := engine.calls(); got != 0 {
+		t.Fatalf("engine was called %d times for an unsupported method", got)
 	}
 }
 
@@ -919,7 +1097,10 @@ func TestRateBucketRefusesWhenTheBurstIsSpent(t *testing.T) {
 	srv.rate.now = clock.Now
 
 	for i := 0; i < rateBurstTokens; i++ {
-		recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+		// A distinct URL per request: the resubmission window is not what this
+		// test is about, and a repeated URL would be dropped before the engine
+		// was ever called.
+		recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/page-"+strconv.Itoa(i))
 
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("request %d: status = %d, want 200 (%s)", i+1, recorder.Code, recorder.Body.String())
@@ -934,7 +1115,7 @@ func TestRateBucketRefusesWhenTheBurstIsSpent(t *testing.T) {
 	}
 
 	// The (capacity+1)th request in the same instant is refused locally.
-	recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+	recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/last")
 
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429 (%s)", recorder.Code, recorder.Body.String())
@@ -966,18 +1147,18 @@ func TestRateLimitIsPerSite(t *testing.T) {
 	srv.rate.now = clock.Now
 
 	for i := 0; i < rateBurstTokens; i++ {
-		if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+		if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/page-"+strconv.Itoa(i)); recorder.Code != http.StatusOK {
 			t.Fatalf("request %d: status = %d, want 200", i+1, recorder.Code)
 		}
 	}
 
-	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusTooManyRequests {
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/last"); recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("exhausted host answered %d, want 429", recorder.Code)
 	}
 
 	// The other site has spent nothing, so it must not inherit its neighbour's
 	// limit: one noisy site is not allowed to silence the rest.
-	recorder, decoded := post(t, srv, `{"urls":["https://`+otherHost+`/a"]}`, "Bearer "+otherToken)
+	recorder, decoded := postURL(t, srv, "Bearer "+otherToken, "https://"+otherHost+"/a")
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("other site: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
@@ -1000,18 +1181,18 @@ func TestRefillAllowsTheNextRequest(t *testing.T) {
 	clock := newFrozenClock()
 	srv.rate.now = clock.Now
 
-	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
 		t.Fatalf("first request: status = %d, want 200", recorder.Code)
 	}
 
-	recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+	recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/b")
 	if recorder.Code != http.StatusTooManyRequests || decoded["reason"] != reasonThrottled {
 		t.Fatalf("second request: status = %d reason = %v, want 429 %q", recorder.Code, decoded["reason"], reasonThrottled)
 	}
 
 	clock.advance(100 * time.Millisecond)
 
-	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/c"); recorder.Code != http.StatusOK {
 		t.Fatalf("after a refill: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
 	}
 
@@ -1050,7 +1231,7 @@ func TestOverloadedWhenNoEngineSlotIsFree(t *testing.T) {
 	// Hold the only slot, as an engine request still in flight would.
 	srv.inflight.slots <- struct{}{}
 
-	recorder, decoded := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken)
+	recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
 
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", recorder.Code, recorder.Body.String())
@@ -1074,7 +1255,7 @@ func TestOverloadedWhenNoEngineSlotIsFree(t *testing.T) {
 	// is busy rather than broken.
 	srv.inflight.release()
 
-	if recorder, _ := post(t, srv, `{"urls":["https://example.com/a"]}`, "Bearer "+testToken); recorder.Code != http.StatusOK {
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
 		t.Fatalf("after the slot was freed: status = %d, want 200", recorder.Code)
 	}
 	if got := engine.calls(); got != 1 {
@@ -1341,5 +1522,271 @@ func TestHealthDetailRecheckRequiresToken(t *testing.T) {
 	defer mu.Unlock()
 	if hits != 0 {
 		t.Fatalf("an unauthenticated recheck fetched the key file %d times", hits)
+	}
+}
+
+// --- the resubmission window ------------------------------------------------
+
+// windowLen reads how many URLs the window remembers, under its lock, the way
+// the server does.
+func windowLen(w *submitWindow) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return len(w.sent)
+}
+
+func TestResubmitWindowDropsARepeatWithinTheWindow(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	clock := newFrozenClock()
+	srv.window.now = clock.Now
+
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
+		t.Fatalf("first: status = %d, want 200", recorder.Code)
+	}
+
+	clock.advance(time.Minute)
+
+	// The same URL over the other method: there is one window and one submission
+	// path, so which method a caller used cannot change what was already sent.
+	recorder, body := getSubmit(t, srv, submitQuery("https://example.com/a"), "Bearer "+testToken)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("repeat: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	// Nothing to send is not a failure: the caller asked for something that is
+	// already true, so the answer is a plain ok with nothing sent.
+	if body["ok"] != true {
+		t.Fatalf("a suppressed batch is not ok: %v", body)
+	}
+	if body["submitted"] != float64(0) || body["skipped"] != float64(1) {
+		t.Fatalf("repeat: submitted = %v, skipped = %v, want 0 and 1", body["submitted"], body["skipped"])
+	}
+	if _, present := body["reason"]; present {
+		t.Fatalf("a suppressed batch carries a reason: %v", body)
+	}
+	if _, present := body["engine_status"]; present {
+		t.Fatalf("a suppressed batch claims an engine status: %v", body)
+	}
+	if got := engine.calls(); got != 1 {
+		t.Fatalf("engine calls = %d, want 1", got)
+	}
+}
+
+func TestResubmitWindowReleasesAfterTheWindow(t *testing.T) {
+	// A suppressed URL must not extend its own window: the timestamp is written
+	// when a URL is actually sent, so a URL retried every minute is sent again a
+	// window after the send, not a window after the last attempt.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	clock := newFrozenClock()
+	srv.window.now = clock.Now
+
+	postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
+
+	clock.advance(resubmitWindow - time.Second)
+
+	if _, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); body["skipped"] != float64(1) {
+		t.Fatalf("inside the window: skipped = %v, want 1", body["skipped"])
+	}
+
+	// A window after the send, with the suppressed attempt in between.
+	clock.advance(time.Second)
+
+	recorder, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("after the window: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["submitted"] != float64(1) {
+		t.Fatalf("after the window: submitted = %v, want 1", body["submitted"])
+	}
+	if got := engine.calls(); got != 2 {
+		t.Fatalf("engine calls = %d, want 2", got)
+	}
+}
+
+func TestResubmitWindowCountsSuppressedURLsBesideSentOnes(t *testing.T) {
+	// A partly suppressed batch still sends the rest, and the dropped URL is
+	// counted rather than vanishing from a response that says submitted: 1.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	clock := newFrozenClock()
+	srv.window.now = clock.Now
+
+	postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
+	clock.advance(time.Minute)
+
+	recorder, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a", "https://example.com/b")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["submitted"] != float64(1) || body["skipped"] != float64(1) {
+		t.Fatalf("submitted = %v, skipped = %v, want 1 and 1", body["submitted"], body["skipped"])
+	}
+	if got := engine.urls(); len(got) != 1 || got[0] != "https://example.com/b" {
+		t.Fatalf("engine received %v, want only the url that was not suppressed", got)
+	}
+}
+
+func TestResubmitWindowIsPerHost(t *testing.T) {
+	// Two sites serve the same path. The window is keyed on the site's host, so
+	// one site's submission cannot silence another's URL.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTwoSiteServer(t, engine)
+
+	clock := newFrozenClock()
+	srv.window.now = clock.Now
+
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
+		t.Fatalf("first site: status = %d, want 200", recorder.Code)
+	}
+
+	recorder, body := postURL(t, srv, "Bearer "+otherToken, "https://"+otherHost+"/a")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("second site: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["submitted"] != float64(1) {
+		t.Fatalf("second site: submitted = %v, want 1", body["submitted"])
+	}
+	if _, present := body["skipped"]; present {
+		t.Fatalf("second site was suppressed by the first: %v", body)
+	}
+	if got := engine.calls(); got != 2 {
+		t.Fatalf("engine calls = %d, want 2", got)
+	}
+}
+
+func TestResubmitWindowForgetsAFailedSubmission(t *testing.T) {
+	// Only an accepted batch proves the URLs were taken. A failure leaves the
+	// caller a retry to make, and suppressing that retry would answer 200
+	// "submitted: 0" to a caller whose first attempt never landed.
+	engine := newFakeEngine(t, http.StatusInternalServerError)
+	srv := newTestServer(t, engine)
+
+	clock := newFrozenClock()
+	srv.window.now = clock.Now
+
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+
+	engine.setStatus(http.StatusOK)
+
+	recorder, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("retry: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["submitted"] != float64(1) {
+		t.Fatalf("retry: submitted = %v, want the url sent again", body["submitted"])
+	}
+	if got := engine.calls(); got != 2 {
+		t.Fatalf("engine calls = %d, want 2", got)
+	}
+}
+
+func TestResubmitWindowStaysBounded(t *testing.T) {
+	// A caller can send arbitrary URLs, so the map has a cap: an unbounded one is
+	// a leak that caller controls. Past the cap the oldest entry goes, because
+	// every entry expires anyway and the oldest is the next to go.
+	const limit = 4
+
+	window := newSubmitWindow(resubmitWindow, limit)
+	clock := newFrozenClock()
+	window.now = clock.Now
+
+	for i := 0; i < limit; i++ {
+		window.record("example.com", []string{"https://example.com/page-" + strconv.Itoa(i)})
+		clock.advance(time.Second)
+	}
+
+	if got := windowLen(window); got != limit {
+		t.Fatalf("window holds %d urls, want %d", got, limit)
+	}
+
+	window.record("example.com", []string{"https://example.com/one-more"})
+
+	if got := windowLen(window); got != limit {
+		t.Fatalf("window holds %d urls after one insert past the cap, want %d", got, limit)
+	}
+
+	// page-0 was the oldest, so it is the entry that went: asking about it keeps
+	// it, while its neighbour is still inside the window.
+	if kept, skipped := window.keep("example.com", []string{"https://example.com/page-0"}); skipped != 0 || len(kept) != 1 {
+		t.Fatalf("the oldest entry survived the cap: skipped %d, kept %v", skipped, kept)
+	}
+	if _, skipped := window.keep("example.com", []string{"https://example.com/page-1"}); skipped != 1 {
+		t.Fatalf("a recent entry was evicted: skipped %d, want 1", skipped)
+	}
+
+	// A batch larger than the whole window cannot be remembered in full. The cap
+	// still wins: it is what keeps arbitrary input from growing this structure.
+	window.record("example.com", []string{
+		"https://example.com/a", "https://example.com/b", "https://example.com/c",
+		"https://example.com/d", "https://example.com/e", "https://example.com/f",
+	})
+
+	if got := windowLen(window); got > limit {
+		t.Fatalf("window holds %d urls after an oversized batch, want at most %d", got, limit)
+	}
+}
+
+func TestResubmitWindowIsSafeUnderConcurrency(t *testing.T) {
+	// The window is shared by every request, so the race detector is the point of
+	// this test: many goroutines keep and record at once, on a window small enough
+	// that all of them also evict.
+	window := newSubmitWindow(resubmitWindow, 8)
+
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+
+		go func(worker int) {
+			defer wg.Done()
+
+			urls := []string{
+				"https://example.com/page-" + strconv.Itoa(worker),
+				"https://example.com/shared",
+			}
+
+			for i := 0; i < 50; i++ {
+				kept, skipped := window.keep("example.com", urls)
+				if skipped > len(urls) {
+					t.Errorf("skipped %d of %d urls", skipped, len(urls))
+				}
+				window.record("example.com", kept)
+			}
+		}(worker)
+	}
+
+	wg.Wait()
+
+	if got := windowLen(window); got > 8 {
+		t.Fatalf("window holds %d urls, want at most 8", got)
+	}
+}
+
+func TestSubmitLogsSkipped(t *testing.T) {
+	var lines bytes.Buffer
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, nil)))
+
+	clock := newFrozenClock()
+	srv.window.now = clock.Now
+
+	postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
+	postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
+
+	if !strings.Contains(lines.String(), "skipped=1") {
+		t.Fatalf("submit log does not say what the window dropped: %s", lines.String())
 	}
 }

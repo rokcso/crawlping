@@ -34,6 +34,11 @@ const reasonPayloadTooLarge = "payload_too_large"
 // bearer token, on every endpoint that takes one.
 const reasonUnknownToken = "unknown_token"
 
+// reasonMethodNotAllowed means the endpoint does not answer this method. It is a
+// reason rather than a bare status because a caller branches on reason, and it
+// pairs with the Allow header that names the methods that do work.
+const reasonMethodNotAllowed = "method_not_allowed"
+
 // There are two different 429s on this endpoint, and the difference is the
 // point of the guard below. reasonThrottled is this instance refusing to spend
 // any more of its own egress IP on one site right now: the engine never saw the
@@ -69,6 +74,32 @@ const (
 	busyRetryAfter = time.Second
 	// recheckTimeout bounds one on-demand recheck of the key files.
 	recheckTimeout = 5 * time.Second
+)
+
+// The resubmission window. IndexNow says a URL should not be resubmitted unless
+// it changed, and that at least 5 minutes should pass before the same URL is
+// sent again - 10 minutes elsewhere in the same documentation. Five is the
+// shorter of the two and the one chosen here: the window exists to keep a
+// caller's retry loop from spending crawl quota on a URL it just sent, not to
+// police how often a page may change, and that decision stays with the caller.
+// Erring short means an operator who genuinely changed a page is delayed less.
+const (
+	// resubmitWindow is how long a URL is remembered after it was sent, per
+	// site host.
+	resubmitWindow = 5 * time.Minute
+	// maxTrackedURLs caps how many URLs are remembered at once. The list is
+	// arbitrary caller input and the token behind it can leak - the same reason
+	// the rate bucket exists - so a map that grows with every URL ever submitted
+	// is a leak a caller controls. 4096 is far more than a realistic site
+	// resubmits inside five minutes and stays a few megabytes at worst.
+	maxTrackedURLs = 4096
+	// maxTrackedURLLength is the longest URL worth remembering. A count-only cap
+	// leaves one entry's size unbounded, and a single URL may be tens of
+	// kilobytes long, so the bound is on bytes too: the worst case is
+	// maxTrackedURLs * maxTrackedURLLength. Past 2048 bytes a URL is longer than
+	// anything a crawler treats as a page, so it is simply not remembered, which
+	// costs at most one resubmission.
+	maxTrackedURLLength = 2048
 )
 
 // keyState is everything this service can honestly say about a host's key file.
@@ -136,6 +167,10 @@ type server struct {
 	// is bound to one host), frequency was not bounded at all.
 	rate     *rateBucket
 	inflight *inflightGuard
+	// window is the per-URL half of the quota guard: a URL it remembers is
+	// dropped from the batch before the request is built, because every
+	// submitted URL spends crawl quota whether or not the engine already had it.
+	window *submitWindow
 	// recheckTimeout bounds one ?recheck=1, and is a field so a test can spend
 	// a few milliseconds instead of five seconds.
 	recheckTimeout time.Duration
@@ -149,6 +184,7 @@ func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
 		keyStates:      make(map[string]keyRecord, len(cfg.Sites)),
 		rate:           newRateBucket(rateBurstTokens, rateRefillInterval),
 		inflight:       newInflightGuard(maxInFlightEngineCalls),
+		window:         newSubmitWindow(resubmitWindow, maxTrackedURLs),
 		recheckTimeout: recheckTimeout,
 	}
 }
@@ -276,9 +312,182 @@ func (g *inflightGuard) release() {
 	<-g.slots
 }
 
+// submitWindow remembers which URLs were sent, per site host, so a caller
+// retrying on a timer does not spend crawl quota on a URL that was announced
+// minutes ago. Every submitted URL spends that quota whether or not the engine
+// already had it.
+//
+// The map is bounded twice - maxTrackedURLs entries of at most
+// maxTrackedURLLength bytes - because the input is arbitrary. When both are
+// reached the oldest entry goes: every entry has the same lifetime, so the
+// oldest is also the one the window would release first, and forgetting it costs
+// at most one early resubmission. An unbounded map would be a leak a caller
+// controls, which is the same harm the rate bucket exists to prevent.
+//
+// The mutex covers the map arithmetic only, never an engine call, and the clock
+// is a field so a test can advance time instead of sleeping - the same shape as
+// rateBucket, for the same reasons.
+type submitWindow struct {
+	window time.Duration
+	limit  int
+	// now is the clock. Production uses time.Now, whose readings carry a
+	// monotonic component, so a wall-clock step cannot stretch or fake the age of
+	// an entry.
+	now func() time.Time
+
+	mu   sync.Mutex
+	sent map[windowKey]time.Time
+}
+
+// windowKey is one URL on one site. The host is part of the key rather than
+// implied by the URL: a URL is absolute, but isolation between sites must not
+// depend on that, and one site may never suppress another's URL.
+type windowKey struct {
+	host string
+	url  string
+}
+
+func newSubmitWindow(window time.Duration, limit int) *submitWindow {
+	return &submitWindow{
+		window: window,
+		limit:  limit,
+		now:    time.Now,
+		sent:   make(map[windowKey]time.Time, 4),
+	}
+}
+
+// keep drops the URLs sent less than the window ago and reports how many it
+// dropped. The kept slice is what the request is built from, so the count and
+// what reaches the engine cannot disagree.
+func (w *submitWindow) keep(host string, urls []string) (kept []string, skipped int) {
+	host = canonicalHost(host)
+	now := w.now()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	kept = make([]string, 0, len(urls))
+	for _, url := range urls {
+		if w.insideWindow(windowKey{host: host, url: url}, now) {
+			skipped++
+			continue
+		}
+		kept = append(kept, url)
+	}
+
+	return kept, skipped
+}
+
+// insideWindow reports whether key was sent less than the window ago, and
+// forgets it when it was not: an entry the window has released can answer
+// nothing, so it must not keep occupying a bounded map.
+func (w *submitWindow) insideWindow(key windowKey, now time.Time) bool {
+	sentAt, known := w.sent[key]
+	if !known {
+		return false
+	}
+
+	age := now.Sub(sentAt)
+	if age >= 0 && age < w.window {
+		return true
+	}
+
+	// Either the window has passed, or the clock went backwards. A backwards
+	// step is not evidence of a recent send, and honouring it would suppress the
+	// URL until the clock caught up, so the entry is forgotten and the URL is
+	// sent again.
+	delete(w.sent, key)
+
+	return false
+}
+
+// record remembers that these URLs were sent just now. Only a request that was
+// actually built and accepted is recorded: a URL that was suppressed must never
+// extend its own window, and a submission that failed leaves the caller a retry
+// to make, which suppressing would silently eat.
+func (w *submitWindow) record(host string, urls []string) {
+	host = canonicalHost(host)
+	now := w.now()
+
+	keys := make([]windowKey, 0, len(urls))
+	for _, url := range urls {
+		if len(url) > maxTrackedURLLength {
+			continue
+		}
+		keys = append(keys, windowKey{host: host, url: url})
+	}
+	if len(keys) == 0 {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Make room for the whole batch once rather than once per URL, so one batch
+	// pays for one sweep.
+	w.makeRoom(now, len(keys))
+
+	for _, key := range keys {
+		w.sent[key] = now
+	}
+
+	// A single batch larger than the whole map cannot be remembered in full, and
+	// here the cap wins: it is what keeps arbitrary input from growing this
+	// structure. maxURLsPerRequest is far below maxTrackedURLs, so this only runs
+	// for a deliberately tiny window.
+	for len(w.sent) > w.limit {
+		w.evictOldest()
+	}
+}
+
+// makeRoom forgets entries until the map can hold need more.
+func (w *submitWindow) makeRoom(now time.Time, need int) {
+	if len(w.sent)+need <= w.limit {
+		return
+	}
+
+	// Entries the window has already released answer nothing, so they go first:
+	// in a normal deployment they are the only ones that ever need to.
+	for key, sentAt := range w.sent {
+		if age := now.Sub(sentAt); age < 0 || age >= w.window {
+			delete(w.sent, key)
+		}
+	}
+
+	for len(w.sent)+need > w.limit && len(w.sent) > 0 {
+		w.evictOldest()
+	}
+}
+
+// evictOldest drops the entry with the earliest timestamp, which is the one the
+// window would have released first anyway.
+func (w *submitWindow) evictOldest() {
+	var (
+		oldest   windowKey
+		oldestAt time.Time
+		found    bool
+	)
+
+	for key, sentAt := range w.sent {
+		if !found || sentAt.Before(oldestAt) {
+			oldest, oldestAt, found = key, sentAt, true
+		}
+	}
+
+	if found {
+		delete(w.sent, oldest)
+	}
+}
+
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /submit", s.handleSubmit)
+	// Registered on the path and not on a method, which is deliberate. A mux
+	// "GET /submit" pattern also routes HEAD, and the Allow header it builds from
+	// its patterns then advertises HEAD for an endpoint where a HEAD would have to
+	// submit something. The handler answers 405 itself instead, so Allow says
+	// exactly what the endpoint does: GET for IndexNow's own single-URL form, which
+	// makes citing one page a single curl, and POST for a batch.
+	mux.HandleFunc("/submit", s.handleSubmit)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	return mux
 }
@@ -295,6 +504,10 @@ type submitResponse struct {
 	Status    int    `json:"status"`
 	Host      string `json:"host,omitempty"`
 	Submitted int    `json:"submitted"`
+	// Skipped counts the URLs the resubmission window dropped before the request
+	// was built. They are not in Submitted, and they are not a reason: the caller
+	// asked for something that is already true. Omitted when nothing was dropped.
+	Skipped int `json:"skipped,omitempty"`
 	// EngineStatus is the status the engine answered with, and is absent
 	// whenever the engine was never called. Together with Reason it separates
 	// "the engine refused this with 422 host_mismatch" from "this instance
@@ -302,8 +515,8 @@ type submitResponse struct {
 	// fix, and only this field tells them apart.
 	EngineStatus int `json:"engine_status,omitempty"`
 	// Reason names why the batch was not accepted. payload_too_large,
-	// throttled and overloaded are the values the handler adds itself: no
-	// submission was ever sent, so no engine produced them.
+	// throttled, overloaded and method_not_allowed are the values the handler
+	// adds itself: no submission was ever sent, so no engine produced them.
 	Reason string `json:"reason,omitempty"`
 	Detail string `json:"detail,omitempty"`
 	// RetryAfterSeconds is set for rate_limited, throttled and overloaded, so a
@@ -312,6 +525,19 @@ type submitResponse struct {
 }
 
 func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		// The endpoint owns its 405 because the router's would advertise HEAD,
+		// which cannot submit anything (see routes). Nothing is read, so an
+		// unsupported method costs no token check and no guard token either.
+		w.Header().Set("Allow", "GET, POST")
+		writeJSON(w, http.StatusMethodNotAllowed, submitResponse{
+			Status: http.StatusMethodNotAllowed,
+			Reason: reasonMethodNotAllowed,
+			Detail: "submit accepts GET and POST only",
+		})
+		return
+	}
+
 	token := bearerToken(r.Header.Get("Authorization"))
 	if token == "" {
 		writeJSON(w, http.StatusUnauthorized, submitResponse{
@@ -336,6 +562,16 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	// spending a byte on it, and it never reaches the engine. That is the whole
 	// point - the engine must not see a request the operator's IP should not
 	// have spent.
+	//
+	// The cost of that order is that these guards cannot see the URL list, so a
+	// batch the resubmission window then empties has still spent a token while
+	// sending nothing. A caller retrying one unchanged URL can therefore use up
+	// its burst and be answered throttled for requests that would have sent
+	// nothing at all. Moving the window ahead of the guards would fix that and
+	// break the rule above: a request that reads and parses a body before
+	// deciding not to send it was not refused cheaply. The trade is stated here
+	// rather than reversed, because frequency is the cheaper thing to police and
+	// the caller can see both counts in the response.
 	if wait := s.rate.take(site.Host); wait > 0 {
 		s.refuse(w, r, site.Host, submissionResult{
 			Reason:     reasonThrottled,
@@ -354,6 +590,90 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.inflight.release()
+
+	urls, ok := s.requestURLs(w, r, site)
+	if !ok {
+		return
+	}
+
+	// duration_ms is the engine call and nothing else, so latency rising before
+	// a throttle shows up in the numbers instead of only in the 429s. It is the
+	// only early warning this tool can give: the engine's limit is not
+	// published, so the trend is the signal.
+	start := time.Now()
+	result := s.client.submitWithWindow(*site, urls, s.window)
+	duration := time.Since(start)
+
+	// Record a key verdict only when the submission produced one. A 200 proves
+	// the key works, 202 says validation is still pending, and 403 says the key
+	// was refused; an engine error or a rate limit says nothing about the key,
+	// so the recorded state is left alone.
+	if state := result.keyStateAfter(); state != "" {
+		s.recordSubmissionKeyState(site.Host, state, result)
+	}
+
+	status := httpStatusFor(result)
+	if result.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(result.RetryAfter)))
+	}
+
+	// engine_status is logged only when an engine actually answered. A locally
+	// refused batch leaves it at 0, and logging that would read as "the engine
+	// answered zero".
+	attrs := make([]slog.Attr, 0, 8)
+	attrs = append(attrs,
+		slog.String("host", site.Host),
+		slog.String("remote", r.RemoteAddr),
+	)
+	if result.EngineStatus != 0 {
+		attrs = append(attrs, slog.Int("engine_status", result.EngineStatus))
+	}
+	attrs = append(attrs,
+		slog.Int("http_status", status),
+		slog.Int("submitted", result.Submitted),
+		// Logged unconditionally, including a zero: a line that sometimes has the
+		// field and sometimes does not is harder to group on than one that always
+		// says how much the window dropped.
+		slog.Int("skipped", result.Skipped),
+		slog.String("reason", result.Reason),
+		slog.Int64("duration_ms", duration.Milliseconds()),
+	)
+	s.log.LogAttrs(r.Context(), slog.LevelInfo, "submit", attrs...)
+
+	writeJSON(w, status, submitResponse{
+		OK:                result.accepted(),
+		Status:            status,
+		Host:              site.Host,
+		Submitted:         result.Submitted,
+		Skipped:           result.Skipped,
+		EngineStatus:      result.EngineStatus,
+		Reason:            result.Reason,
+		Detail:            result.Detail,
+		RetryAfterSeconds: retryAfterSeconds(result.RetryAfter),
+	})
+}
+
+// requestURLs reads the URL list a /submit request carries. A GET carries it in
+// repeated url query parameters, which is IndexNow's own single-URL form and
+// what makes citing one page a single curl; a POST carries it in a
+// {"urls": [...]} object. The method decides nothing after this point, so both
+// go through the same validation, the same reasons and statuses, the same log
+// line and the same key-state and window update: one path, one answer shape,
+// whichever method was used.
+//
+// It writes the refusal itself and reports false when the list cannot be read:
+// an oversized or unparseable body has its own status and its own detail, so
+// there is nothing left for the caller to answer.
+func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, site *Site) ([]string, bool) {
+	if r.Method == http.MethodGet {
+		// Query()["url"] returns every repeated value, so ?url=a&url=b carries
+		// two. A query with no url at all leaves the list empty, which the
+		// submission path already refuses as bad_request.
+		return r.URL.Query()["url"], true
+	}
+
+	// POST, the only other method the handler answers, and the only one that
+	// carries a body: the size cap and the JSON decoder below apply to it alone.
 
 	// The cap is enforced by reading the body, not by the decoder. A decoder
 	// stops at the end of the first JSON value, so a small value followed by
@@ -381,7 +701,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 				Reason: reasonPayloadTooLarge,
 				Detail: fmt.Sprintf("body exceeded the %d byte limit", maxBodyBytes),
 			})
-			return
+			return nil, false
 		}
 
 		// The body could not be read at all, so there is nothing to parse and
@@ -392,7 +712,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			Reason: reasonBadRequest,
 			Detail: "body could not be read",
 		})
-		return
+		return nil, false
 	}
 
 	var request submitRequest
@@ -403,59 +723,10 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			Reason: reasonBadRequest,
 			Detail: `body must be a single {"urls": ["https://..."]} object with no trailing data`,
 		})
-		return
+		return nil, false
 	}
 
-	// duration_ms is the engine call and nothing else, so latency rising before
-	// a throttle shows up in the numbers instead of only in the 429s. It is the
-	// only early warning this tool can give: the engine's limit is not
-	// published, so the trend is the signal.
-	start := time.Now()
-	result := s.client.submit(*site, request.URLs)
-	duration := time.Since(start)
-
-	// Record a key verdict only when the submission produced one. A 200 proves
-	// the key works, 202 says validation is still pending, and 403 says the key
-	// was refused; an engine error or a rate limit says nothing about the key,
-	// so the recorded state is left alone.
-	if state := result.keyStateAfter(); state != "" {
-		s.recordSubmissionKeyState(site.Host, state, result)
-	}
-
-	status := httpStatusFor(result)
-	if result.RetryAfter > 0 {
-		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(result.RetryAfter)))
-	}
-
-	// engine_status is logged only when an engine actually answered. A locally
-	// refused batch leaves it at 0, and logging that would read as "the engine
-	// answered zero".
-	attrs := make([]slog.Attr, 0, 7)
-	attrs = append(attrs,
-		slog.String("host", site.Host),
-		slog.String("remote", r.RemoteAddr),
-	)
-	if result.EngineStatus != 0 {
-		attrs = append(attrs, slog.Int("engine_status", result.EngineStatus))
-	}
-	attrs = append(attrs,
-		slog.Int("http_status", status),
-		slog.Int("submitted", result.Submitted),
-		slog.String("reason", result.Reason),
-		slog.Int64("duration_ms", duration.Milliseconds()),
-	)
-	s.log.LogAttrs(r.Context(), slog.LevelInfo, "submit", attrs...)
-
-	writeJSON(w, status, submitResponse{
-		OK:                result.accepted(),
-		Status:            status,
-		Host:              site.Host,
-		Submitted:         result.Submitted,
-		EngineStatus:      result.EngineStatus,
-		Reason:            result.Reason,
-		Detail:            result.Detail,
-		RetryAfterSeconds: retryAfterSeconds(result.RetryAfter),
-	})
+	return request.URLs, true
 }
 
 // refuse answers a submission this instance declined to send. The engine was
@@ -701,6 +972,10 @@ func httpStatusFor(result submissionResult) int {
 		// Not the caller's fault and not permanent: this instance had no free
 		// engine slot in time, so the request is worth retrying shortly.
 		return http.StatusServiceUnavailable
+	case reasonMethodNotAllowed:
+		// The method is wrong, so the identical request will be refused
+		// identically: a client error, not a retry.
+		return http.StatusMethodNotAllowed
 	default:
 		// engine_error and anything unrecognised: the engine failed or the
 		// request never landed, so the caller should try again later.
