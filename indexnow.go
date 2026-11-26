@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -26,12 +27,21 @@ const (
 	reasonInvalidURL = "invalid_url"
 	// reasonTooMany means the batch carried more than maxURLsPerRequest URLs.
 	reasonTooMany = "too_many"
-	// reasonNonDefaultPort means one entry names a port the engine will not accept.
+	// reasonNonDefaultPort means one entry names a port this instance will not
+	// forward. This is a local rule, not an IndexNow requirement: neither the
+	// spec nor its FAQ states a port restriction, and the common client-library
+	// practice is to strip a default port during normalisation. The rule is
+	// defensive, because one URL the engine refuses poisons the whole batch.
 	reasonNonDefaultPort = "non_default_port"
 	// reasonKeyRejected means the engine did not accept the key file.
 	reasonKeyRejected = "key_rejected"
 	// reasonHostMismatch means one entry is not on the site's own host.
 	reasonHostMismatch = "host_mismatch"
+	// reasonOutOfKeyScope means one entry is outside the directory the key file
+	// is served from, so the key does not answer for it even though the host
+	// matches. The caller's fix differs from host_mismatch: the key file has to
+	// move, or the out-of-scope URLs have to stop being submitted.
+	reasonOutOfKeyScope = "out_of_key_scope"
 	// reasonRateLimited is the engine throttling; retry later.
 	reasonRateLimited = "rate_limited"
 	// reasonEngineRejected means the engine refused the request in a way that
@@ -84,7 +94,11 @@ var (
 	errInvalidURL = errors.New("invalid url")
 	// errForeignHost means an entry is not on the site's own host.
 	errForeignHost = errors.New("foreign host")
-	// errNonDefaultPort means an entry names a port IndexNow will not accept.
+	// errOutOfKeyScope means an entry is outside the directory the key file is
+	// served from.
+	errOutOfKeyScope = errors.New("outside key scope")
+	// errNonDefaultPort means an entry names a port this instance does not
+	// forward. That is a local policy, not a rule the engine publishes.
 	errNonDefaultPort = errors.New("non-default port")
 )
 
@@ -209,7 +223,7 @@ func keyStateAfterCheck(err error) keyState {
 // the engine may already have received. The call therefore gets its own timeout
 // from context.Background and cancels it when it returns.
 func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
-	clean, err := filterURLs(site.Host, urls)
+	clean, err := filterURLsInScope(site.Host, site.PathScope, urls)
 	if err != nil {
 		// Locally refused: the engine was never called, so EngineStatus stays
 		// 0 and the reason plus detail say what the caller has to fix.
@@ -283,11 +297,28 @@ func (c *indexNowClient) submit(site Site, urls []string) submissionResult {
 }
 
 // filterURLs keeps only URLs on the site's own host, deduplicated and capped.
-// It refuses the whole batch when one URL is bad: a caller mixing hosts has a
-// bug, and the engine would reject the batch anyway. The error always names
-// the entry that caused the refusal, and a batch with one unusable entry is
-// never reported as "no usable urls".
+// It applies no path restriction, which is what a key file at the host root
+// allows: it is filterURLsInScope with an empty scope, so a caller that has no
+// key_location to honour stays a one-argument call.
 func filterURLs(host string, urls []string) (clean []string, err error) {
+	return filterURLsInScope(host, "", urls)
+}
+
+// filterURLsInScope keeps only URLs on the site's own host and inside the
+// directory keyScope names, deduplicated and capped. An empty keyScope means no
+// path restriction.
+//
+// The scope half is not decoration. IndexNow scopes a key to the directory its
+// file is served from, so a key file at /catalog/<key>.txt may not submit
+// /help/page even though the host matches, and the engine refuses the whole
+// batch for it. Refusing here is the difference between a 400 the caller can
+// act on and a green local check over a batch that was never going to land.
+//
+// It refuses the whole batch when one URL is bad: a caller mixing hosts or
+// directories has a bug, and the engine would reject the batch anyway. The
+// error always names the entry that caused the refusal, and a batch with one
+// unusable entry is never reported as "no usable urls".
+func filterURLsInScope(host, keyScope string, urls []string) (clean []string, err error) {
 	want := canonicalHost(host)
 	seen := make(map[string]bool, len(urls))
 
@@ -304,13 +335,27 @@ func filterURLs(host string, urls []string) (clean []string, err error) {
 
 		if port := parsed.Port(); port != "" && port != defaultPort(parsed.Scheme) {
 			return nil, fmt.Errorf(
-				"%w: %q uses port %q, and IndexNow accepts the default port only",
+				"%w: %q uses port %q, and this instance forwards the default port only",
 				errNonDefaultPort, trimmed, port,
 			)
 		}
 
 		if canonicalHost(parsed.Hostname()) != want {
 			return nil, fmt.Errorf("%w: %q is not on %s", errForeignHost, trimmed, want)
+		}
+
+		// Query and fragment are not part of what the scope covers: the key
+		// file's directory scopes the path, and /catalog/show?item=23 is still
+		// under /catalog/.
+		urlPath := parsed.Path
+		if urlPath == "" {
+			urlPath = "/"
+		}
+		if !withinKeyScope(urlPath, keyScope) {
+			return nil, fmt.Errorf(
+				"%w: %q is not under %s, the directory the key file is served from",
+				errOutOfKeyScope, trimmed, keyScope,
+			)
 		}
 
 		// A fragment marks a place inside a document, not another resource, and
@@ -339,6 +384,26 @@ func filterURLs(host string, urls []string) (clean []string, err error) {
 	return clean, nil
 }
 
+// withinKeyScope reports whether an absolute URL path may be submitted with a
+// key file served from keyScope. An empty scope, and the root directory, allow
+// every path: a key file at the host root answers for the whole host, which is
+// the default configuration and must keep working unchanged.
+//
+// The comparison is on segment boundaries, not on a string prefix, so a scope
+// of /catalog/ accepts /catalog and /catalog/x but not /catalogue/x. The path
+// is cleaned first, so a dot segment cannot step out of the directory the key
+// file scopes.
+func withinKeyScope(urlPath, keyScope string) bool {
+	dir := strings.TrimSuffix(keyScope, "/")
+	if dir == "" {
+		return true
+	}
+
+	cleanPath := path.Clean(urlPath)
+
+	return cleanPath == dir || strings.HasPrefix(cleanPath, dir+"/")
+}
+
 // canonicalHost folds the two things that are not part of a host's identity:
 // its case and the trailing dot of an absolute DNS name. Both sides of the
 // comparison go through it, so a configured "Example.com." still matches
@@ -349,7 +414,8 @@ func canonicalHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 }
 
-// defaultPort is the only port IndexNow accepts for a scheme.
+// defaultPort is the port a scheme defaults to, and the only one this instance
+// forwards: a non-default port is refused by policy, not by an IndexNow rule.
 func defaultPort(scheme string) string {
 	if scheme == "http" {
 		return "80"
@@ -370,6 +436,8 @@ func reasonForURLError(err error) string {
 		return reasonNonDefaultPort
 	case errors.Is(err, errForeignHost):
 		return reasonHostMismatch
+	case errors.Is(err, errOutOfKeyScope):
+		return reasonOutOfKeyScope
 	case errors.Is(err, errInvalidURL):
 		return reasonInvalidURL
 	default:

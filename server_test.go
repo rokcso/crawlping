@@ -118,6 +118,17 @@ func newTestServerWithLog(t *testing.T, engine *fakeEngine, log *slog.Logger) *s
 	return newServer(cfg, newIndexNowClient(engine.server.URL), log)
 }
 
+func newTestServerForSite(t *testing.T, engine *fakeEngine, site Site) *server {
+	t.Helper()
+
+	cfg := &Config{
+		Listen: "127.0.0.1:0",
+		Sites:  []Site{site},
+	}
+
+	return newServer(cfg, newIndexNowClient(engine.server.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
 func post(t *testing.T, srv *server, body string, authorization string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 
@@ -220,6 +231,93 @@ func TestSubmitSurfacesRetryAfter(t *testing.T) {
 	}
 	if body["retry_after_seconds"] != float64(120) {
 		t.Fatalf("retry_after_seconds = %v", body["retry_after_seconds"])
+	}
+}
+
+func TestSubmitRejectsURLOutsideKeyScopeWithoutCallingEngine(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServerForSite(t, engine, Site{
+		Host:        "example.com",
+		IndexNowKey: "abc123def456",
+		KeyLocation: "https://example.com/catalog/abc123def456.txt",
+		PathScope:   "/catalog/",
+		Token:       testToken,
+	})
+
+	recorder, body := post(t, srv, `{"urls":["https://example.com/help/page"]}`, "Bearer "+testToken)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", recorder.Code, recorder.Body.String())
+	}
+	// Pinned as a string because it is what a caller branches on.
+	if body["reason"] != "out_of_key_scope" {
+		t.Fatalf("reason = %v, want out_of_key_scope", body["reason"])
+	}
+	detail, _ := body["detail"].(string)
+	if !strings.Contains(detail, "https://example.com/help/page") {
+		t.Fatalf("detail does not name the offending url: %q", detail)
+	}
+	if !strings.Contains(detail, "/catalog/") {
+		t.Fatalf("detail does not name the allowed prefix: %q", detail)
+	}
+	if engine.calls() != 0 {
+		t.Fatalf("engine was called %d times for an out-of-scope batch", engine.calls())
+	}
+}
+
+func TestSubmitAcceptsURLsInsideKeyScope(t *testing.T) {
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServerForSite(t, engine, Site{
+		Host:        "example.com",
+		IndexNowKey: "abc123def456",
+		KeyLocation: "https://example.com/catalog/abc123def456.txt",
+		PathScope:   "/catalog/",
+		Token:       testToken,
+	})
+
+	recorder, body := post(t,
+		srv,
+		`{"urls":["https://example.com/catalog","https://example.com/catalog/show?item=23"]}`,
+		"Bearer "+testToken,
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["submitted"] != float64(2) {
+		t.Fatalf("submitted = %v, want 2", body["submitted"])
+	}
+	if engine.calls() != 1 {
+		t.Fatalf("engine was called %d times, want 1", engine.calls())
+	}
+}
+
+func TestSubmitWithRootKeyFileAcceptsEveryPath(t *testing.T) {
+	// The derived scope of the default key_location, https://<host>/<key>.txt,
+	// is the host root. Every existing deployment runs that configuration, so a
+	// root scope must not restrict anything.
+	cfg, err := loadConfig(writeConfig(t, singleSiteConfig("example.com", configTestKey)))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newServer(cfg, newIndexNowClient(engine.server.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	recorder, body := post(t,
+		srv,
+		`{"urls":["https://example.com/","https://example.com/anything","https://example.com/a/b"]}`,
+		"Bearer "+configTestToken,
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["submitted"] != float64(3) {
+		t.Fatalf("submitted = %v, want 3", body["submitted"])
+	}
+	if engine.calls() != 1 {
+		t.Fatalf("engine was called %d times, want 1", engine.calls())
 	}
 }
 

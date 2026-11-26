@@ -280,6 +280,78 @@ func TestLoadConfigMissingFile(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDerivesKeyPathScope(t *testing.T) {
+	// The IndexNow spec scopes a key to the directory its key file is served
+	// from, so the scope is derived from the final key_location instead of being
+	// configured separately. Only the path counts: a query or fragment on the
+	// location cannot widen what the key covers.
+	cases := []struct {
+		name        string
+		keyLocation string
+		want        string
+	}{
+		{name: "default location at the root", want: "/"},
+		{
+			name:        "explicit location at the root",
+			keyLocation: "https://example.com/" + configTestKey + ".txt",
+			want:        "/",
+		},
+		{
+			name:        "one directory down",
+			keyLocation: "https://example.com/catalog/" + configTestKey + ".txt",
+			want:        "/catalog/",
+		},
+		{
+			name:        "nested directories",
+			keyLocation: "https://example.com/a/b/" + configTestKey + ".txt",
+			want:        "/a/b/",
+		},
+		{
+			name:        "query and fragment ignored",
+			keyLocation: "https://example.com/catalog/" + configTestKey + ".txt?cache=1#top",
+			want:        "/catalog/",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			body := singleSiteConfig("example.com", configTestKey)
+			if testCase.keyLocation != "" {
+				body = fmt.Sprintf(`
+sites:
+  - host: example.com
+    indexnow_key: %q
+    key_location: %q
+    token: %q
+`, configTestKey, testCase.keyLocation, configTestToken)
+			}
+
+			cfg, err := loadConfig(writeConfig(t, body))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+
+			if got := cfg.Sites[0].PathScope; got != testCase.want {
+				t.Fatalf("path scope = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigCannotSetPathScopeDirectly(t *testing.T) {
+	// The scope is derived, so a file that tries to set it is refused rather
+	// than silently drifting away from key_location.
+	body := fmt.Sprintf(`
+sites:
+  - host: example.com
+    indexnow_key: %q
+    path_scope: /help/
+    token: %q
+`, configTestKey, configTestToken)
+
+	mustReject(t, body, "parse config")
+}
+
 func TestLoadConfigRejectsAKeyLocationOnAnotherHost(t *testing.T) {
 	// IndexNow fetches the key from the host being submitted for, so a key file
 	// that lives somewhere else is refused with 422 whatever it contains. That

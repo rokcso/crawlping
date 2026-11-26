@@ -679,9 +679,12 @@ func httpStatusFor(result submissionResult) int {
 	switch result.Reason {
 	case reasonAccepted:
 		return http.StatusOK
-	case reasonBadRequest, reasonInvalidURL, reasonTooMany, reasonNonDefaultPort, reasonEngineRejected:
+	case reasonBadRequest, reasonInvalidURL, reasonTooMany, reasonNonDefaultPort, reasonOutOfKeyScope, reasonEngineRejected:
 		// The request will be refused identically if it is sent again, so it is
-		// a client error, not a host problem and not a retryable one.
+		// a client error, not a host problem and not a retryable one. An
+		// out-of-scope URL belongs here and not with host_mismatch: the host was
+		// right, so the caller has to move the key file or stop submitting URLs
+		// outside its directory.
 		return http.StatusBadRequest
 	case reasonPayloadTooLarge:
 		return http.StatusRequestEntityTooLarge

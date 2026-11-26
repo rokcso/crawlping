@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"regexp"
 	"strings"
 
@@ -18,7 +19,12 @@ type Site struct {
 	Host        string `yaml:"host"`
 	IndexNowKey string `yaml:"indexnow_key"`
 	KeyLocation string `yaml:"key_location"`
-	Token       string `yaml:"token"`
+	// PathScope is derived from KeyLocation in loadConfig and cannot be set in
+	// the file, so the two can never disagree. The IndexNow spec scopes the
+	// URLs a key may submit to the directory its key file is served from, and
+	// this is that directory: /catalog/key.txt -> /catalog/, /key.txt -> /.
+	PathScope string `yaml:"-"`
+	Token     string `yaml:"token"`
 }
 
 // Config is the mounted file. There is no environment layer: one file, read
@@ -142,6 +148,11 @@ func loadConfig(path string) (*Config, error) {
 		if err := checkKeyLocationHost(*site); err != nil {
 			return nil, fmt.Errorf("site %s: %w", site.Host, err)
 		}
+
+		// The same paragraph of the spec scopes a key to the directory its file
+		// is served from, so the scope is read from the final key_location
+		// rather than configured separately.
+		site.PathScope = keyPathScope(site.KeyLocation)
 	}
 
 	return &cfg, nil
@@ -193,6 +204,26 @@ func hint(value string, max int) string {
 		return value
 	}
 	return value[:max] + "..."
+}
+
+// keyPathScope returns the directory a key file is served from, as an absolute
+// path with a trailing slash: /catalog/key.txt -> /catalog/, /key.txt -> /,
+// /a/b/key.txt -> /a/b/. It keeps the path only, so a query or fragment on the
+// key_location cannot widen the scope.
+func keyPathScope(keyLocation string) string {
+	parsed, err := url.Parse(keyLocation)
+	if err != nil {
+		// checkKeyLocationHost has already refused an unparseable key_location,
+		// so this is unreachable. An empty scope means no path restriction, which
+		// is the safe reading: it refuses nothing the host check allowed.
+		return ""
+	}
+
+	if parsed.Path == "" || parsed.Path == "/" {
+		return "/"
+	}
+
+	return strings.TrimSuffix(pathpkg.Dir(parsed.Path), "/") + "/"
 }
 
 // checkKeyLocationHost refuses a key_location that cannot answer for the site's

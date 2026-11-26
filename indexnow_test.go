@@ -291,6 +291,177 @@ func TestFilterURLsCollapsesFragmentOnlyDuplicatesForEngine(t *testing.T) {
 	}
 }
 
+func TestFilterURLsRootKeyScopeAllowsEveryPath(t *testing.T) {
+	// A key file at the host root answers for the whole host, which is both the
+	// default configuration and every deployment that predates path scoping, so
+	// the root scope must not restrict anything.
+	urls := []string{
+		"https://example.com/anything",
+		"https://example.com/",
+		"https://example.com/a/b",
+		"https://example.com/help/deep/page",
+	}
+
+	for _, scope := range []string{"/", ""} {
+		clean, err := filterURLsInScope("example.com", scope, urls)
+		if err != nil {
+			t.Fatalf("scope %q: %v", scope, err)
+		}
+		if len(clean) != len(urls) {
+			t.Fatalf("scope %q: clean = %v, want every url kept", scope, clean)
+		}
+	}
+
+	// The unscoped call is the same call, so an existing caller keeps working.
+	clean, err := filterURLs("example.com", urls)
+	if err != nil {
+		t.Fatalf("filterURLs: %v", err)
+	}
+	if len(clean) != len(urls) {
+		t.Fatalf("filterURLs: clean = %v, want every url kept", clean)
+	}
+}
+
+func TestFilterURLsInScopeKeepsOnlyURLsUnderTheKeyDirectory(t *testing.T) {
+	// The spec: a key file at /catalog/<key>.txt may submit URLs starting with
+	// /catalog/ and nothing else. /catalogue/x is the case a plain string
+	// prefix check gets wrong, and /catalog is the directory itself, which is
+	// inside it.
+	cases := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "the directory itself", url: "https://example.com/catalog", want: true},
+		{name: "the directory with a trailing slash", url: "https://example.com/catalog/", want: true},
+		{name: "a page under it", url: "https://example.com/catalog/x", want: true},
+		{name: "a page under it with a query", url: "https://example.com/catalog/show?item=23", want: true},
+		{name: "the host root", url: "https://example.com/", want: false},
+		{name: "another directory", url: "https://example.com/help/page", want: false},
+		{name: "a sibling sharing the name prefix", url: "https://example.com/catalogue/x", want: false},
+		{name: "a dot segment out of the directory", url: "https://example.com/catalog/../help", want: false},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clean, err := filterURLsInScope("example.com", "/catalog/", []string{testCase.url})
+
+			if testCase.want {
+				if err != nil {
+					t.Fatalf("unexpected refusal: %v", err)
+				}
+				if len(clean) != 1 {
+					t.Fatalf("clean = %v, want the url kept", clean)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("expected a refusal, got %v", clean)
+			}
+			if !errors.Is(err, errOutOfKeyScope) {
+				t.Fatalf("err = %v, want %v", err, errOutOfKeyScope)
+			}
+			if !strings.Contains(err.Error(), testCase.url) {
+				t.Fatalf("error does not name the offending url: %v", err)
+			}
+			if !strings.Contains(err.Error(), "/catalog/") {
+				t.Fatalf("error does not name the allowed prefix: %v", err)
+			}
+			if reason := reasonForURLError(err); reason != reasonOutOfKeyScope {
+				t.Fatalf("reason = %q, want %q", reason, reasonOutOfKeyScope)
+			}
+			if got := httpStatusFor(submissionResult{Reason: reasonOutOfKeyScope}); got != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
+func TestFilterURLsInScopeComparesSegmentsAtAnyDepth(t *testing.T) {
+	// A nested key file scopes to the nested directory only.
+	clean, err := filterURLsInScope("example.com", "/a/b/", []string{
+		"https://example.com/a/b",
+		"https://example.com/a/b/c/d",
+	})
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	if len(clean) != 2 {
+		t.Fatalf("clean = %v, want two urls", clean)
+	}
+
+	for _, outside := range []string{"https://example.com/a", "https://example.com/a/bc/d", "https://example.com/b/c"} {
+		if _, err := filterURLsInScope("example.com", "/a/b/", []string{outside}); !errors.Is(err, errOutOfKeyScope) {
+			t.Fatalf("%q: err = %v, want %v", outside, err, errOutOfKeyScope)
+		}
+	}
+}
+
+func TestFilterURLsInScopeLeavesForeignHostAsHostMismatch(t *testing.T) {
+	// A foreign host stays host_mismatch even when it is also outside the scope:
+	// the host is the more basic problem and the fix is different.
+	_, err := filterURLsInScope("example.com", "/catalog/", []string{"https://evil.test/help/page"})
+
+	if !errors.Is(err, errForeignHost) {
+		t.Fatalf("err = %v, want %v", err, errForeignHost)
+	}
+	if reason := reasonForURLError(err); reason != reasonHostMismatch {
+		t.Fatalf("reason = %q, want %q", reason, reasonHostMismatch)
+	}
+}
+
+func TestSubmitRefusesOutOfScopeURLWithoutCallingEngine(t *testing.T) {
+	engine := newStubEngine(t, http.StatusOK, "")
+	site := stubSite("example.com")
+	site.PathScope = "/catalog/"
+
+	result := engine.client().submit(site, []string{
+		"https://example.com/catalog/ok",
+		"https://example.com/help/page",
+	})
+
+	if engine.calls != 0 {
+		t.Fatalf("engine was called %d times for an out-of-scope batch", engine.calls)
+	}
+	if result.Reason != reasonOutOfKeyScope {
+		t.Fatalf("reason = %q, want %q", result.Reason, reasonOutOfKeyScope)
+	}
+	if !strings.Contains(result.Detail, "https://example.com/help/page") {
+		t.Fatalf("detail does not name the offending url: %q", result.Detail)
+	}
+	if !strings.Contains(result.Detail, "/catalog/") {
+		t.Fatalf("detail does not name the allowed prefix: %q", result.Detail)
+	}
+	if result.EngineStatus != 0 {
+		t.Fatalf("engine status = %d, want 0", result.EngineStatus)
+	}
+	if got := httpStatusFor(result); got != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+	}
+}
+
+func TestSubmitForwardsURLsInsideKeyScope(t *testing.T) {
+	engine := newStubEngine(t, http.StatusOK, "")
+	site := stubSite("example.com")
+	site.PathScope = "/catalog/"
+
+	result := engine.client().submit(site, []string{
+		"https://example.com/catalog",
+		"https://example.com/catalog/show?item=23",
+	})
+
+	if !result.accepted() {
+		t.Fatalf("reason = %q (%s)", result.Reason, result.Detail)
+	}
+	if result.Submitted != 2 {
+		t.Fatalf("submitted = %d, want 2", result.Submitted)
+	}
+	if engine.calls != 1 {
+		t.Fatalf("engine was called %d times, want 1", engine.calls)
+	}
+}
+
 func TestSubmitLocalRefusalLeavesEngineStatusZero(t *testing.T) {
 	engine := newStubEngine(t, http.StatusOK, "")
 	result := engine.client().submit(stubSite("example.com"), []string{"https://example.com/ok", ""})
@@ -406,6 +577,7 @@ func TestHTTPStatusForMapsEveryReason(t *testing.T) {
 		reasonInvalidURL:       http.StatusBadRequest,
 		reasonTooMany:          http.StatusBadRequest,
 		reasonNonDefaultPort:   http.StatusBadRequest,
+		reasonOutOfKeyScope:    http.StatusBadRequest,
 		reasonEngineRejected:   http.StatusBadRequest,
 		reasonKeyRejected:      http.StatusForbidden,
 		reasonHostMismatch:     http.StatusUnprocessableEntity,
