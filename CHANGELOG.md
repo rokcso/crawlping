@@ -48,15 +48,6 @@ rename, so a `SIGHUP` reload reads the old inode and the site count never change
   `chown 65532` you added to work around the old failure. Restarting once here is
   fine; the reload matters after this point. No API change: `/submit`, `/health`
   and `/metrics` are as v0.2.0 left them.
-- **`crawlping_submissions_total` counts guard refusals now.** A request the rate
-  bucket or the concurrency guard refused is one submission, one `reason`
-  (`throttled` or `overloaded`) and one guard `kind`, so
-  `crawlping_guard_refusals_total` is a breakdown of `submissions_total` rather
-  than a total beside it. A dashboard that added the two families together counts
-  those requests twice from this version on: read the submissions family alone.
-  Those refusals carry no engine status and no latency sample, because nothing was
-  sent.
-
 ### Added
 
 - `crawlping site add -host ...` generates the key and token, appends the entry,
@@ -91,6 +82,15 @@ rename, so a `SIGHUP` reload reads the old inode and the site count never change
 
 ### Changed
 
+- **`crawlping_submissions_total` counts guard refusals now.** A request the rate
+  bucket or the concurrency guard refused is one submission, one `reason`
+  (`throttled` or `overloaded`) and one guard `kind`, so
+  `crawlping_guard_refusals_total` is a breakdown of `submissions_total` rather
+  than a total beside it. A dashboard that added the two families together counts
+  those requests twice from this version on: read the submissions family alone.
+  An alert on the level of the submissions family sees a step equal to the refusal
+  rate, which is the traffic it was already being refused. Those refusals carry no
+  engine status and no latency sample, because nothing was sent.
 - The per-site engine share is decided once, from the site count at startup, and a
   reload deliberately keeps the share it is running with - the share is the width
   of a semaphore that may already have slots held, and it cannot be resized
