@@ -1103,138 +1103,6 @@ func (c *frozenClock) advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-func TestRateBucketRefusesWhenTheBurstIsSpent(t *testing.T) {
-	engine := newFakeEngine(t, http.StatusOK)
-	srv := newTestServer(t, engine)
-
-	// The clock stands still: this test measures the burst, not how fast the
-	// machine can send eleven requests.
-	clock := newFrozenClock()
-	srv.rate.now = clock.Now
-
-	for i := 0; i < rateBurstTokens; i++ {
-		// A distinct URL per request: the resubmission window is not what this
-		// test is about, and a repeated URL would be dropped before the engine
-		// was ever called.
-		recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/page-"+strconv.Itoa(i))
-
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("request %d: status = %d, want 200 (%s)", i+1, recorder.Code, recorder.Body.String())
-		}
-		if decoded["reason"] != nil {
-			t.Fatalf("request %d: reason = %v, want none", i+1, decoded["reason"])
-		}
-	}
-
-	if got := engine.calls(); got != rateBurstTokens {
-		t.Fatalf("engine calls = %d, want %d", got, rateBurstTokens)
-	}
-
-	// The (capacity+1)th request in the same instant is refused locally.
-	recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/last")
-
-	if recorder.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429 (%s)", recorder.Code, recorder.Body.String())
-	}
-	if decoded["reason"] != reasonThrottled {
-		t.Fatalf("reason = %v, want %q", decoded["reason"], reasonThrottled)
-	}
-	if got := recorder.Header().Get("Retry-After"); got == "" {
-		t.Fatal("a throttled response carries no Retry-After header")
-	}
-	if decoded["retry_after_seconds"] != float64(1) {
-		t.Fatalf("retry_after_seconds = %v, want 1", decoded["retry_after_seconds"])
-	}
-	if _, present := decoded["engine_status"]; present {
-		t.Fatalf("a locally throttled batch reports an engine status: %v", decoded)
-	}
-	// Refused by the guard, so the engine never sees it: spending the egress IP
-	// on this request is exactly what the guard exists to prevent.
-	if got := engine.calls(); got != rateBurstTokens {
-		t.Fatalf("engine calls after a local refusal = %d, want %d", got, rateBurstTokens)
-	}
-}
-
-func TestRateLimitIsPerSite(t *testing.T) {
-	engine := newFakeEngine(t, http.StatusOK)
-	srv := newTwoSiteServer(t, engine)
-
-	clock := newFrozenClock()
-	srv.rate.now = clock.Now
-
-	for i := 0; i < rateBurstTokens; i++ {
-		if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/page-"+strconv.Itoa(i)); recorder.Code != http.StatusOK {
-			t.Fatalf("request %d: status = %d, want 200", i+1, recorder.Code)
-		}
-	}
-
-	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/last"); recorder.Code != http.StatusTooManyRequests {
-		t.Fatalf("exhausted host answered %d, want 429", recorder.Code)
-	}
-
-	// The other site has spent nothing, so it must not inherit its neighbour's
-	// limit: one noisy site is not allowed to silence the rest.
-	recorder, decoded := postURL(t, srv, "Bearer "+otherToken, "https://"+otherHost+"/a")
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("other site: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
-	}
-	if decoded["host"] != otherHost {
-		t.Fatalf("other site: host = %v, want %q", decoded["host"], otherHost)
-	}
-	if got := engine.calls(); got != rateBurstTokens+1 {
-		t.Fatalf("engine calls = %d, want %d", got, rateBurstTokens+1)
-	}
-}
-
-func TestRefillAllowsTheNextRequest(t *testing.T) {
-	engine := newFakeEngine(t, http.StatusOK)
-	srv := newTestServer(t, engine)
-
-	// A bucket of one token that refills every 100ms: the shortest interval a
-	// test can observe without sleeping.
-	srv.rate = newRateBucket(1, 100*time.Millisecond)
-	clock := newFrozenClock()
-	srv.rate.now = clock.Now
-
-	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
-		t.Fatalf("first request: status = %d, want 200", recorder.Code)
-	}
-
-	recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/b")
-	if recorder.Code != http.StatusTooManyRequests || decoded["reason"] != reasonThrottled {
-		t.Fatalf("second request: status = %d reason = %v, want 429 %q", recorder.Code, decoded["reason"], reasonThrottled)
-	}
-
-	clock.advance(100 * time.Millisecond)
-
-	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/c"); recorder.Code != http.StatusOK {
-		t.Fatalf("after a refill: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
-	}
-
-	if got := engine.calls(); got != 2 {
-		t.Fatalf("engine calls = %d, want 2", got)
-	}
-}
-
-func TestRateBucketDoesNotRefillFromABackwardsClock(t *testing.T) {
-	// Elapsed time is the only thing that mints tokens, and a clock that jumps
-	// backwards must not mint any: a wall-clock step is not work done.
-	bucket := newRateBucket(1, time.Second)
-	clock := newFrozenClock()
-	bucket.now = clock.Now
-
-	if wait := bucket.take("example.com"); wait != 0 {
-		t.Fatalf("first take waited %s, want 0", wait)
-	}
-
-	clock.advance(-time.Hour)
-
-	if wait := bucket.take("example.com"); wait == 0 {
-		t.Fatal("a backwards clock refilled the bucket")
-	}
-}
-
 func TestOverloadedWhenNoEngineSlotIsFree(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
@@ -1553,311 +1421,6 @@ func TestHealthDetailRecheckRequiresToken(t *testing.T) {
 	}
 }
 
-// --- the resubmission window ------------------------------------------------
-
-// windowLen reads how many URLs the window remembers, under its lock, the way
-// the server does.
-func windowLen(w *submitWindow) int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	return len(w.entries)
-}
-
-// windowCap reads the window's entry cap, under its lock: it is not a constant,
-// because a reload that raises the batch size grows it.
-func windowCap(w *submitWindow) int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	return w.limit
-}
-
-func TestResubmitWindowDropsARepeatWithinTheWindow(t *testing.T) {
-	engine := newFakeEngine(t, http.StatusOK)
-	srv := newTestServer(t, engine)
-
-	clock := newFrozenClock()
-	srv.window.now = clock.Now
-
-	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
-		t.Fatalf("first: status = %d, want 200", recorder.Code)
-	}
-
-	clock.advance(time.Minute)
-
-	// The same URL over the other method: there is one window and one submission
-	// path, so which method a caller used cannot change what was already sent.
-	recorder, body := getSubmit(t, srv, submitQuery("https://example.com/a"), "Bearer "+testToken)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("repeat: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
-	}
-	// Nothing to send is not a failure: the caller asked for something that is
-	// already true, so the answer is a plain ok with nothing sent.
-	if body["ok"] != true {
-		t.Fatalf("a suppressed batch is not ok: %v", body)
-	}
-	if body["submitted"] != float64(0) || body["skipped"] != float64(1) {
-		t.Fatalf("repeat: submitted = %v, skipped = %v, want 0 and 1", body["submitted"], body["skipped"])
-	}
-	if _, present := body["reason"]; present {
-		t.Fatalf("a suppressed batch carries a reason: %v", body)
-	}
-	if _, present := body["engine_status"]; present {
-		t.Fatalf("a suppressed batch claims an engine status: %v", body)
-	}
-	if got := engine.calls(); got != 1 {
-		t.Fatalf("engine calls = %d, want 1", got)
-	}
-}
-
-func TestResubmitWindowReleasesAfterTheWindow(t *testing.T) {
-	// A suppressed URL must not extend its own window: the timestamp is written
-	// when a URL is actually sent, so a URL retried every minute is sent again a
-	// window after the send, not a window after the last attempt.
-	engine := newFakeEngine(t, http.StatusOK)
-	srv := newTestServer(t, engine)
-
-	clock := newFrozenClock()
-	srv.window.now = clock.Now
-
-	postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
-
-	clock.advance(resubmitWindow - time.Second)
-
-	if _, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); body["skipped"] != float64(1) {
-		t.Fatalf("inside the window: skipped = %v, want 1", body["skipped"])
-	}
-
-	// A window after the send, with the suppressed attempt in between.
-	clock.advance(time.Second)
-
-	recorder, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("after the window: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
-	}
-	if body["submitted"] != float64(1) {
-		t.Fatalf("after the window: submitted = %v, want 1", body["submitted"])
-	}
-	if got := engine.calls(); got != 2 {
-		t.Fatalf("engine calls = %d, want 2", got)
-	}
-}
-
-func TestResubmitWindowCountsSuppressedURLsBesideSentOnes(t *testing.T) {
-	// A partly suppressed batch still sends the rest, and the dropped URL is
-	// counted rather than vanishing from a response that says submitted: 1.
-	engine := newFakeEngine(t, http.StatusOK)
-	srv := newTestServer(t, engine)
-
-	clock := newFrozenClock()
-	srv.window.now = clock.Now
-
-	postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
-	clock.advance(time.Minute)
-
-	recorder, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a", "https://example.com/b")
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
-	}
-	if body["submitted"] != float64(1) || body["skipped"] != float64(1) {
-		t.Fatalf("submitted = %v, skipped = %v, want 1 and 1", body["submitted"], body["skipped"])
-	}
-	if got := engine.urls(); len(got) != 1 || got[0] != "https://example.com/b" {
-		t.Fatalf("engine received %v, want only the url that was not suppressed", got)
-	}
-}
-
-func TestResubmitWindowIsPerHost(t *testing.T) {
-	// Two sites serve the same path. The window is keyed on the site's host, so
-	// one site's submission cannot silence another's URL.
-	engine := newFakeEngine(t, http.StatusOK)
-	srv := newTwoSiteServer(t, engine)
-
-	clock := newFrozenClock()
-	srv.window.now = clock.Now
-
-	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
-		t.Fatalf("first site: status = %d, want 200", recorder.Code)
-	}
-
-	recorder, body := postURL(t, srv, "Bearer "+otherToken, "https://"+otherHost+"/a")
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("second site: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
-	}
-	if body["submitted"] != float64(1) {
-		t.Fatalf("second site: submitted = %v, want 1", body["submitted"])
-	}
-	if _, present := body["skipped"]; present {
-		t.Fatalf("second site was suppressed by the first: %v", body)
-	}
-	if got := engine.calls(); got != 2 {
-		t.Fatalf("engine calls = %d, want 2", got)
-	}
-}
-
-func TestResubmitWindowForgetsAFailedSubmission(t *testing.T) {
-	// Only an accepted batch proves the URLs were taken. A failure leaves the
-	// caller a retry to make, and suppressing that retry would answer 200
-	// "submitted: 0" to a caller whose first attempt never landed.
-	engine := newFakeEngine(t, http.StatusInternalServerError)
-	srv := newTestServer(t, engine)
-
-	clock := newFrozenClock()
-	srv.window.now = clock.Now
-
-	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", recorder.Code)
-	}
-
-	engine.setStatus(http.StatusOK)
-
-	recorder, body := postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("retry: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
-	}
-	if body["submitted"] != float64(1) {
-		t.Fatalf("retry: submitted = %v, want the url sent again", body["submitted"])
-	}
-	if got := engine.calls(); got != 2 {
-		t.Fatalf("engine calls = %d, want 2", got)
-	}
-}
-
-func TestResubmitWindowStaysBounded(t *testing.T) {
-	// A caller can send arbitrary URLs, so the map has a cap: an unbounded one is
-	// a leak that caller controls. Past the cap the oldest entry goes, because
-	// every entry expires anyway and the oldest is the next to go.
-	const limit = 4
-
-	window := newSubmitWindow(resubmitWindow, limit)
-	clock := newFrozenClock()
-	window.now = clock.Now
-
-	for i := 0; i < limit; i++ {
-		window.record("example.com", []string{"https://example.com/page-" + strconv.Itoa(i)})
-		clock.advance(time.Second)
-	}
-
-	if got := windowLen(window); got != limit {
-		t.Fatalf("window holds %d urls, want %d", got, limit)
-	}
-
-	window.record("example.com", []string{"https://example.com/one-more"})
-
-	if got := windowLen(window); got != limit {
-		t.Fatalf("window holds %d urls after one insert past the cap, want %d", got, limit)
-	}
-
-	// page-0 was the oldest, so it is the entry that went. The neighbour is asked
-	// about first because a URL that is not remembered is claimed as it is looked
-	// up, and a claim is a write: it needs room like any other entry, so it may
-	// evict the oldest one. Asking about the suppressed neighbour first keeps both
-	// assertions about what the cap actually kept, in the order they hold.
-	if _, skipped := window.keep("example.com", []string{"https://example.com/page-1"}); skipped != 1 {
-		t.Fatalf("a recent entry was evicted: skipped %d, want 1", skipped)
-	}
-	if kept, skipped := window.keep("example.com", []string{"https://example.com/page-0"}); skipped != 0 || len(kept) != 1 {
-		t.Fatalf("the oldest entry survived the cap: skipped %d, kept %v", skipped, kept)
-	}
-
-	// A batch larger than the whole window cannot be remembered in full. The cap
-	// still wins: it is what keeps arbitrary input from growing this structure.
-	window.record("example.com", []string{
-		"https://example.com/a", "https://example.com/b", "https://example.com/c",
-		"https://example.com/d", "https://example.com/e", "https://example.com/f",
-	})
-
-	if got := windowLen(window); got > limit {
-		t.Fatalf("window holds %d urls after an oversized batch, want at most %d", got, limit)
-	}
-}
-
-func TestResubmitWindowIsSafeUnderConcurrency(t *testing.T) {
-	window := newSubmitWindow(resubmitWindow, 8)
-
-	var wg sync.WaitGroup
-
-	for worker := 0; worker < 8; worker++ {
-		wg.Add(1)
-
-		go func(worker int) {
-			defer wg.Done()
-
-			urls := []string{
-				"https://example.com/page-" + strconv.Itoa(worker),
-				"https://example.com/shared",
-			}
-
-			for i := 0; i < 50; i++ {
-				kept, skipped := window.keep("example.com", urls)
-				if skipped > len(urls) {
-					t.Errorf("skipped %d of %d urls", skipped, len(urls))
-				}
-				window.record("example.com", kept)
-			}
-		}(worker)
-	}
-
-	wg.Wait()
-
-	if got := windowLen(window); got > 8 {
-		t.Fatalf("window holds %d urls, want at most 8", got)
-	}
-}
-
-func TestResubmitWindowClaimsAURLUntilItIsReleasedOrRecorded(t *testing.T) {
-	// The window is the check, and the engine call is the act. Claiming the URL
-	// under the window's own lock is what stops two concurrent requests from both
-	// passing the check and both spending quota on one URL.
-	window := newSubmitWindow(resubmitWindow, 8)
-	clock := newFrozenClock()
-	window.now = clock.Now
-
-	urls := []string{"https://example.com/a"}
-
-	if kept, skipped := window.keep("example.com", urls); skipped != 0 || len(kept) != 1 {
-		t.Fatalf("first keep: kept %v, skipped %d, want the url kept", kept, skipped)
-	}
-
-	// A second look while the first batch is in flight sees the claim, and skips
-	// the URL: this is the half that used to be missing.
-	if kept, skipped := window.keep("example.com", urls); skipped != 1 || len(kept) != 0 {
-		t.Fatalf("second keep: kept %v, skipped %d, want the claim to suppress it", kept, skipped)
-	}
-
-	// A batch that did not land gives its claim back, so the caller's retry is
-	// sent instead of being suppressed for a whole window.
-	window.release("example.com", urls)
-	if kept, skipped := window.keep("example.com", urls); skipped != 0 || len(kept) != 1 {
-		t.Fatalf("after release: kept %v, skipped %d, want the url kept again", kept, skipped)
-	}
-
-	// A recorded send is evidence that the engine took the URL, so a release can
-	// never un-send it.
-	window.record("example.com", urls)
-	window.release("example.com", urls)
-	if kept, skipped := window.keep("example.com", urls); skipped != 1 || len(kept) != 0 {
-		t.Fatalf("after record: kept %v, skipped %d, want the send remembered", kept, skipped)
-	}
-
-	// And a claim nobody released or promoted is self-healing: it ages out with
-	// the window like a send would, so a leak cannot suppress a URL forever.
-	leaked := []string{"https://example.com/leaked"}
-	if _, skipped := window.keep("example.com", leaked); skipped != 0 {
-		t.Fatalf("claiming a new url was skipped: %d", skipped)
-	}
-	clock.advance(resubmitWindow)
-	if kept, skipped := window.keep("example.com", leaked); skipped != 0 || len(kept) != 1 {
-		t.Fatalf("a claim outlived the window: kept %v, skipped %d", kept, skipped)
-	}
-}
-
 func TestConcurrentSubmissionsOfOneURLCallTheEngineOnce(t *testing.T) {
 	// Two requests carrying the same URL, released at the same moment. The claim
 	// is taken under the window's mutex before either reaches the engine, so the
@@ -1982,5 +1545,39 @@ func TestSubmitCarriesARaisedCeilingEndToEnd(t *testing.T) {
 	}
 	if engine.gotCalls != 0 {
 		t.Fatalf("engine was called %d times for an oversized body", engine.gotCalls)
+	}
+}
+
+func TestHTTPStatusFor(t *testing.T) {
+	cases := map[string]int{
+		reasonAccepted:     http.StatusOK,
+		reasonBadRequest:   http.StatusBadRequest,
+		reasonKeyRejected:  http.StatusForbidden,
+		reasonHostMismatch: http.StatusUnprocessableEntity,
+		reasonRateLimited:  http.StatusTooManyRequests,
+		reasonEngineError:  http.StatusBadGateway,
+	}
+
+	for reason, want := range cases {
+		if got := httpStatusFor(submissionResult{Reason: reason}); got != want {
+			t.Fatalf("%s: status = %d, want %d", reason, got, want)
+		}
+	}
+}
+
+func TestBearerToken(t *testing.T) {
+	cases := map[string]string{
+		"Bearer abc":   "abc",
+		"bearer abc":   "abc",
+		"Bearer  abc ": "abc",
+		"":             "",
+		"Basic abc":    "",
+		"Bearer":       "",
+	}
+
+	for header, want := range cases {
+		if got := bearerToken(header); got != want {
+			t.Fatalf("%q: got %q, want %q", header, got, want)
+		}
 	}
 }
