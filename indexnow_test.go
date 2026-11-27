@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stubEngine stands in for api.indexnow.org so the tests can pin what the
@@ -741,5 +742,102 @@ func TestThrottledIsNotTheEnginesRateLimit(t *testing.T) {
 	}
 	if got := httpStatusFor(submissionResult{Reason: reasonOverloaded}); got != http.StatusServiceUnavailable {
 		t.Fatalf("overloaded maps to %d, want 503", got)
+	}
+}
+
+func TestFilterURLs(t *testing.T) {
+	cases := []struct {
+		name      string
+		host      string
+		urls      []string
+		wantClean int
+		wantBad   bool
+	}{
+		{
+			name:      "keeps same-host urls",
+			host:      "example.com",
+			urls:      []string{"https://example.com/a", "http://example.com/b"},
+			wantClean: 2,
+		},
+		{
+			name:      "collapses duplicates",
+			host:      "example.com",
+			urls:      []string{"https://example.com/a", "https://example.com/a"},
+			wantClean: 1,
+		},
+		{
+			name:    "refuses a foreign host",
+			host:    "example.com",
+			urls:    []string{"https://example.com/a", "https://evil.test/b"},
+			wantBad: true,
+		},
+		{
+			name:    "refuses a lookalike subdomain",
+			host:    "example.com",
+			urls:    []string{"https://example.com.evil.test/a"},
+			wantBad: true,
+		},
+		{
+			name:    "refuses a non-http scheme",
+			host:    "example.com",
+			urls:    []string{"javascript:alert(1)"},
+			wantBad: true,
+		},
+		{
+			name:    "refuses garbage",
+			host:    "example.com",
+			urls:    []string{"not a url"},
+			wantBad: true,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clean, err := filterURLs(testCase.host, testCase.urls)
+
+			if testCase.wantBad {
+				if err == nil {
+					t.Fatalf("expected the batch to be refused, got %v", clean)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected refusal: %v", err)
+			}
+			if len(clean) != testCase.wantClean {
+				t.Fatalf("clean = %d urls, want %d", len(clean), testCase.wantClean)
+			}
+		})
+	}
+}
+
+func TestFilterURLsCapsBatchSize(t *testing.T) {
+	// The cap is applied by the submit path now, with the configured number, so
+	// this pins that a batch over the default is refused there and that the
+	// refusal names the limit it broke.
+	urls := make([]string, 0, maxURLsPerRequest+1)
+	for i := 0; i <= maxURLsPerRequest; i++ {
+		urls = append(urls, fmt.Sprintf("https://example.com/page-%d", i))
+	}
+
+	clean, err := filterURLs("example.com", urls)
+	if err != nil {
+		t.Fatalf("filterURLs refused the batch: %v", err)
+	}
+	if len(clean) <= maxURLsPerRequest {
+		t.Fatalf("clean = %d urls, want more than the default cap of %d so the submit path has to refuse it", len(clean), maxURLsPerRequest)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if got := parseRetryAfter("120"); got != 2*time.Minute {
+		t.Fatalf("seconds form = %v", got)
+	}
+	if got := parseRetryAfter(""); got != time.Minute {
+		t.Fatalf("empty form = %v", got)
+	}
+	if got := parseRetryAfter("not-a-value"); got != time.Minute {
+		t.Fatalf("garbage form = %v", got)
 	}
 }
