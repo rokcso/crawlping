@@ -313,7 +313,7 @@ func TestMetricsObserveOneDurationSamplePerEngineCall(t *testing.T) {
 
 	// And so is a call that never landed: that is the latency worth seeing most
 	// of all, so it must not be the one case the histogram skips.
-	srv.client = newIndexNowClient("http://127.0.0.1:1/indexnow")
+	setTestClient(srv, newIndexNowClient("http://127.0.0.1:1/indexnow"))
 
 	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/c"); recorder.Code != http.StatusBadGateway {
 		t.Fatalf("unreachable engine: status = %d, want 502 (%s)", recorder.Code, recorder.Body.String())

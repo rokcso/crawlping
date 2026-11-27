@@ -131,6 +131,21 @@ func newTestServerForSite(t *testing.T, engine *fakeEngine, site Site) *server {
 	return newServer(cfg, newIndexNowClient(engine.server.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
+// testRuntime is how a test reaches the config a server is currently serving.
+// The fields are not exposed on *server any more because they are swapped whole
+// on reload; reading through the same pointer the handlers read keeps a test
+// honest about what the running instance actually sees.
+func testRuntime(srv *server) *runtime {
+	return srv.rt.Load()
+}
+
+// setTestClient swaps in a client that can reach nothing, or one that points
+// somewhere else, without disturbing the rest of the runtime.
+func setTestClient(srv *server, client *indexNowClient) {
+	rt := srv.rt.Load()
+	srv.rt.Store(newRuntime(rt.cfg, client))
+}
+
 func post(t *testing.T, srv *server, body string, authorization string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 
@@ -635,7 +650,7 @@ func TestHealthCountsPendingUntilChecked(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 
 	pending := getHealth(t, srv)
 	if !pending.OK || pending.Sites != 1 || pending.Pending != 1 || pending.Verified != 0 || pending.Failed != 0 {
@@ -663,7 +678,7 @@ func TestHealthCountsFailedKeyCheck(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 
 	srv.verifyAll(context.Background())
 
@@ -820,7 +835,7 @@ func TestVerifyAllCanceledLeavesStateUntouched(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	srv.cfg.Sites[0].KeyLocation = "http://127.0.0.1:1/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = "http://127.0.0.1:1/key.txt"
 	srv.setKeyState("example.com", keyStateVerified, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -848,7 +863,7 @@ func TestVerifyAllDeadlineLeavesPending(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServerWithLog(t, engine, slog.New(slog.NewTextHandler(&lines, nil)))
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 	srv.setKeyState("example.com", keyStateVerified, "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -877,7 +892,7 @@ func TestVerifyAllMarksBrokenKeyFile(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 
 	srv.verifyAll(context.Background())
 
@@ -894,7 +909,7 @@ func TestVerifyAllMarksGoodKeyFile(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 
 	srv.verifyAll(context.Background())
 
@@ -1443,7 +1458,7 @@ func TestRecheckRefreshesCheckedAt(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 
 	stale := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	srv.mu.Lock()
@@ -1493,7 +1508,7 @@ func TestRecheckCutShortDoesNotDowngrade(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 	srv.recheckTimeout = 20 * time.Millisecond
 	srv.setKeyState("example.com", keyStateVerified, "")
 
@@ -1522,7 +1537,7 @@ func TestHealthDetailRecheckRequiresToken(t *testing.T) {
 
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	srv.cfg.Sites[0].KeyLocation = keyServer.URL + "/key.txt"
+	testRuntime(srv).sites[0].KeyLocation = keyServer.URL + "/key.txt"
 
 	for _, authorization := range []string{"", "Bearer wrong"} {
 		recorder := callHealth(t, srv, "detail=1&recheck=1", authorization)

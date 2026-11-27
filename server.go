@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -10,9 +11,11 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -153,9 +156,18 @@ func newKeyRecord(state keyState, detail string) keyRecord {
 }
 
 type server struct {
-	cfg    *Config
-	client *indexNowClient
-	log    *slog.Logger
+	// rt is everything the config file decides. It is a pointer that is swapped
+	// whole on SIGHUP rather than fields edited in place, so a request either
+	// sees the old config or the new one and never a half-applied mixture, and
+	// readers need no lock to get a consistent view.
+	//
+	// The stateful guards below are deliberately not in it: a reload must not
+	// forget a throttle that is still running (that would hand out the burst
+	// again) and must not reset the counters /metrics exists to report. A reload
+	// changes who may submit and where submissions go; it does not rewrite what
+	// already happened.
+	rt  atomic.Pointer[runtime]
+	log *slog.Logger
 
 	mu sync.RWMutex
 	// keyStates holds the last recorded state per host. A host that is absent
@@ -178,18 +190,32 @@ type server struct {
 	// dropped from the batch before the request is built, because every
 	// submitted URL spends crawl quota whether or not the engine already had it.
 	window *submitWindow
+	// recheckTimeout bounds one ?recheck=1, and is a field so a test can spend
+	// a few milliseconds instead of five seconds.
+	recheckTimeout time.Duration
+}
+
+// runtime is one loaded config and the client that submits for it. Everything
+// here is derived from the config file, and the Config it points at is never
+// mutated after construction, which is what makes handing the same slices to
+// concurrent requests safe.
+type runtime struct {
+	cfg    *Config
+	sites  []Site
+	client *indexNowClient
 	// maxURLs and maxBodyBytes are the effective submission limits. They are
 	// fields rather than reads of cfg.Limits because a Config built without
 	// loadConfig has zero values, and those have to mean the default here too -
 	// otherwise a zero body cap would answer 413 to every request.
 	maxURLs      int
 	maxBodyBytes int
-	// recheckTimeout bounds one ?recheck=1, and is a field so a test can spend
-	// a few milliseconds instead of five seconds.
-	recheckTimeout time.Duration
+	// source is the config bytes this runtime was built from, when it came from
+	// a file. It is how a reload tells "the operator changed nothing" apart from
+	// "this process is reading an inode the host has already replaced".
+	source []byte
 }
 
-func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
+func newRuntime(cfg *Config, client *indexNowClient) *runtime {
 	// Zero means "not set", the same rule the file follows, so a Config built by
 	// hand (a test, or any caller that did not come through loadConfig) takes the
 	// defaults instead of answering 413 to everything.
@@ -201,28 +227,122 @@ func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
 		maxBodyBytes = defaultMaxBodyBytes
 	}
 
+	return &runtime{
+		cfg:          cfg,
+		sites:        cfg.Sites,
+		client:       client,
+		maxURLs:      maxURLs,
+		maxBodyBytes: maxBodyBytes,
+	}
+}
+
+func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
+	return newServerWithSource(cfg, client, log, nil)
+}
+
+// newServerWithSource is newServer for a config that came from a file: source is
+// the bytes it was built from, and it is what lets a reload tell "nothing
+// changed" apart from "this process is reading an inode the host has already
+// replaced". Only cmdServe passes it; tests and hand-built configs pass nil.
+func newServerWithSource(cfg *Config, client *indexNowClient, log *slog.Logger, source []byte) *server {
 	// The window has to be able to remember one full batch, or a raised
 	// max_urls_per_request would send URLs it then silently forgets, and every
 	// one of them would be resubmitted immediately. Its own cap still applies on
-	// top, as the bound on arbitrary input.
+	// top, as the bound on arbitrary input. It is sized from the config this
+	// instance starts with and keeps that size across reloads: it is a memory
+	// bound on remembered URLs, not a property of the current batch limit.
 	tracked := maxTrackedURLs
-	if maxURLs > tracked {
+	if maxURLs := newRuntime(cfg, client).maxURLs; maxURLs > tracked {
 		tracked = maxURLs
 	}
 
-	return &server{
-		cfg:            cfg,
-		client:         client,
+	s := &server{
 		log:            log,
 		keyStates:      make(map[string]keyRecord, len(cfg.Sites)),
 		rate:           newRateBucket(rateBurstTokens, rateRefillInterval),
 		inflight:       newInflightGuard(perHostInFlightLimit(len(cfg.Sites)), maxInFlightEngineCalls),
 		metrics:        newSubmissionMetrics(),
 		window:         newSubmitWindow(resubmitWindow, tracked),
-		maxURLs:        maxURLs,
-		maxBodyBytes:   maxBodyBytes,
 		recheckTimeout: recheckTimeout,
 	}
+	rt := newRuntime(cfg, client)
+	rt.source = source
+	s.rt.Store(rt)
+
+	return s
+}
+
+// reload swaps in the config that is on disk now, and is what SIGHUP runs.
+//
+// It is the reason adding a site does not need a restart: the running process
+// keeps its listener, its in-flight submissions and its counters, and the next
+// request sees the new site list. A config that does not load changes nothing -
+// the running one keeps serving - because a typo in a file must not be able to
+// take down an API that a Worker is calling.
+func (s *server) reload(ctx context.Context, path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	cfg, err := parseConfig(raw)
+	if err != nil {
+		return err
+	}
+
+	// The bytes are compared, not the file. A container whose config is mounted
+	// as a single file keeps the inode it was started with, so an atomic replace
+	// on the host - which is what `site add` does, on purpose - is invisible
+	// here: the signal arrives, the config loads, nothing is added. That failure
+	// is silent, which makes it worse than an error, so it gets a line of its
+	// own. Nothing else can be done from inside the wrong inode.
+	if prev := s.rt.Load(); prev != nil && prev.source != nil && bytes.Equal(prev.source, raw) {
+		s.log.Warn("config reload read the same bytes it already had: if the file was just edited, this container is reading a pinned inode - mount its directory instead of the file",
+			"path", path, "sites", len(cfg.Sites))
+	}
+
+	return s.applyConfigBytes(ctx, cfg, raw)
+}
+
+// applyConfig installs a config that has already loaded. reload is the only
+// production caller; it is separate so a test can install a Config directly,
+// which is the only way to point a runtime at a local key server without
+// weakening the host rule loadConfig enforces.
+func (s *server) applyConfig(ctx context.Context, cfg *Config) error {
+	return s.applyConfigBytes(ctx, cfg, nil)
+}
+
+func (s *server) applyConfigBytes(ctx context.Context, cfg *Config, raw []byte) error {
+	next := newRuntime(cfg, newIndexNowClient(cfg.IndexNowEndpoint))
+	next.source = raw
+	prev := s.rt.Swap(next)
+
+	// Only hosts the previous config did not already carry are checked. The
+	// other states are evidence about files that have not changed, and a reload
+	// must not replace a verdict the engine itself gave with the weaker answer of
+	// a key-file fetch that may simply be timing out.
+	var added []Site
+	if prev != nil {
+		known := make(map[string]bool, len(prev.sites))
+		for _, site := range prev.sites {
+			known[site.Host] = true
+		}
+		for _, site := range next.sites {
+			if !known[site.Host] {
+				added = append(added, site)
+			}
+		}
+	}
+
+	s.log.Info("config reloaded", "sites", len(next.sites), "added", len(added))
+
+	if len(added) > 0 {
+		// In the background, like the startup check: a slow origin must not hold
+		// the signal handler, and /health fills in as each answer arrives.
+		go s.verifySites(ctx, next.client, added)
+	}
+
+	return nil
 }
 
 // rateBucket is a per-host token bucket. It is the frequency half of the guard:
@@ -728,6 +848,8 @@ type submitResponse struct {
 }
 
 func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
+	rt := s.rt.Load()
+
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		// The endpoint owns its 405 because the router's would advertise HEAD,
 		// which cannot submit anything (see routes). Nothing is read, so an
@@ -750,7 +872,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	site := s.siteForToken(token)
+	site := rt.siteForToken(token)
 	if site == nil {
 		s.log.Warn("submit rejected", "reason", reasonUnknownToken, "remote", r.RemoteAddr)
 		writeJSON(w, http.StatusUnauthorized, submitResponse{
@@ -800,7 +922,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.inflight.release(site.Host)
 
-	urls, ok := s.requestURLs(w, r, site)
+	urls, ok := s.requestURLs(w, r, rt, site)
 	if !ok {
 		return
 	}
@@ -810,7 +932,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	// only early warning this tool can give: the engine's limit is not
 	// published, so the trend is the signal.
 	start := time.Now()
-	result := s.client.submitWithWindow(*site, urls, s.window, s.maxURLs)
+	result := rt.client.submitWithWindow(*site, urls, s.window, rt.maxURLs)
 	duration := time.Since(start)
 
 	// Counted whatever the outcome: this request was handled, and the reason
@@ -879,7 +1001,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 // It writes the refusal itself and reports false when the list cannot be read:
 // an oversized or unparseable body has its own status and its own detail, so
 // there is nothing left for the caller to answer.
-func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, site *Site) ([]string, bool) {
+func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, rt *runtime, site *Site) ([]string, bool) {
 	if r.Method == http.MethodGet {
 		// Query()["url"] returns every repeated value, so ?url=a&url=b carries
 		// two. A query with no url at all leaves the list empty, which the
@@ -896,7 +1018,7 @@ func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, site *Site)
 	// MaxBytesReader has nothing to refuse. Reading all of it applies the cap
 	// to the bytes that were actually sent, and json.Unmarshal then rejects
 	// anything left over after the value.
-	r.Body = http.MaxBytesReader(w, r.Body, int64(s.maxBodyBytes))
+	r.Body = http.MaxBytesReader(w, r.Body, int64(rt.maxBodyBytes))
 
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -911,7 +1033,7 @@ func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, site *Site)
 				"remote", r.RemoteAddr,
 			)
 			s.refuseBody(w, site, http.StatusRequestEntityTooLarge, reasonPayloadTooLarge,
-				fmt.Sprintf("body exceeded the %d byte limit", s.maxBodyBytes))
+				fmt.Sprintf("body exceeded the %d byte limit", rt.maxBodyBytes))
 			return nil, false
 		}
 
@@ -1040,26 +1162,29 @@ type healthErrorResponse struct {
 // so an anonymous GET must not be able to enumerate the operator's domains. That
 // is the same rule /health follows, and it reuses the same token lookup.
 func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	perHost := s.siteForToken(bearerToken(r.Header.Get("Authorization"))) != nil
+	rt := s.rt.Load()
+	perHost := rt.siteForToken(bearerToken(r.Header.Get("Authorization"))) != nil
 
 	w.Header().Set("Content-Type", metricsContentType)
 	w.WriteHeader(http.StatusOK)
 
 	// The two snapshots are taken separately and never nested, so a scrape
 	// cannot hold the key-state lock while it waits for the counter lock.
-	writeMetrics(w, s.metrics.snapshot(), s.keyStatesSnapshot(), perHost)
+	writeMetrics(w, s.metrics.snapshot(), s.keyStatesSnapshot(rt), perHost)
 }
 
 // handleHealth answers whether the process is up. A stale key file is counted
 // as failed but never changes the status code: the process is up, and
 // restarting the container would not fix a key file on someone else's origin.
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	rt := s.rt.Load()
+
 	if !detailRequested(r) {
-		verified, failed, pending := countKeyStates(s.keyStatesSnapshot())
+		verified, failed, pending := countKeyStates(s.keyStatesSnapshot(rt))
 
 		writeJSON(w, http.StatusOK, healthResponse{
 			OK:       true,
-			Sites:    len(s.cfg.Sites),
+			Sites:    len(rt.sites),
 			Verified: verified,
 			Failed:   failed,
 			Pending:  pending,
@@ -1070,7 +1195,7 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// Per-host detail names the operator's domains, so it needs a token. An
 	// absent header cannot pass by accident: every configured token is at least
 	// minTokenLength characters, and an empty string never matches one.
-	if s.siteForToken(bearerToken(r.Header.Get("Authorization"))) == nil {
+	if rt.siteForToken(bearerToken(r.Header.Get("Authorization"))) == nil {
 		s.log.Warn("health detail rejected", "reason", reasonUnknownToken, "remote", r.RemoteAddr)
 		writeJSON(w, http.StatusUnauthorized, healthErrorResponse{
 			OK:     false,
@@ -1083,13 +1208,13 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// A recheck runs after the token check, so an unauthenticated caller can
 	// never make this instance fetch anything.
 	if recheckRequested(r) {
-		s.recheckKeys(r.Context())
+		s.recheckKeys(r.Context(), rt)
 	}
 
 	writeJSON(w, http.StatusOK, healthDetailResponse{
 		OK:    true,
-		Sites: len(s.cfg.Sites),
-		Keys:  s.keyStatesSnapshot(),
+		Sites: len(rt.sites),
+		Keys:  s.keyStatesSnapshot(rt),
 	})
 }
 
@@ -1124,12 +1249,12 @@ func detailRequested(r *http.Request) bool {
 
 // keyStatesSnapshot returns a record for every configured host, defaulting to
 // pending, so the counts always add up to the number of sites.
-func (s *server) keyStatesSnapshot() map[string]keyRecord {
+func (s *server) keyStatesSnapshot(rt *runtime) map[string]keyRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	states := make(map[string]keyRecord, len(s.cfg.Sites))
-	for _, site := range s.cfg.Sites {
+	states := make(map[string]keyRecord, len(rt.sites))
+	for _, site := range rt.sites {
 		record, known := s.keyStates[site.Host]
 		if !known {
 			// Never checked: pending, with no time and no detail, because there
@@ -1162,12 +1287,12 @@ func countKeyStates(states map[string]keyRecord) (verified, failed, pending int)
 // siteForToken compares against every configured token in constant time and
 // keeps the last match, so timing does not reveal which site a token belongs
 // to.
-func (s *server) siteForToken(token string) *Site {
+func (rt *runtime) siteForToken(token string) *Site {
 	given := []byte(token)
 
 	var found *Site
-	for i := range s.cfg.Sites {
-		site := &s.cfg.Sites[i]
+	for i := range rt.sites {
+		site := &rt.sites[i]
 		if subtle.ConstantTimeCompare(given, []byte(site.Token)) == 1 {
 			found = site
 		}
@@ -1257,9 +1382,17 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 // would otherwise add up in front of a 5s container start period. The result is
 // advisory - it only fills in /health, and no outcome here stops the process.
 func (s *server) verifyAll(ctx context.Context) {
-	for _, site := range s.cfg.Sites {
+	rt := s.rt.Load()
+	s.verifySites(ctx, rt.client, rt.sites)
+}
+
+// verifySites checks every key file in the given list. The client and the site
+// list are passed together rather than read from the server, so a reload during
+// a run cannot mix the old client with the new sites.
+func (s *server) verifySites(ctx context.Context, client *indexNowClient, sites []Site) {
+	for _, site := range sites {
 		checkCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
-		err := s.client.verifyKey(checkCtx, site)
+		err := client.verifyKey(checkCtx, site)
 		cancel()
 
 		s.recordCheck(site, err)
@@ -1272,12 +1405,12 @@ func (s *server) verifyAll(ctx context.Context) {
 // check would pay a permanent cost - a fetch per host, forever - for a rare
 // event. An operator who has just fixed a key file can ask for a fresh answer
 // instead, which is the only moment the answer matters.
-func (s *server) recheckKeys(ctx context.Context) {
+func (s *server) recheckKeys(ctx context.Context, rt *runtime) {
 	ctx, cancel := context.WithTimeout(ctx, s.recheckTimeout)
 	defer cancel()
 
-	for _, site := range s.cfg.Sites {
-		err := s.client.verifyKey(ctx, site)
+	for _, site := range rt.sites {
+		err := rt.client.verifyKey(ctx, site)
 
 		if ctx.Err() != nil {
 			// The recheck ran out of budget, not the origin being wrong. A
