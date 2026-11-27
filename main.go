@@ -32,6 +32,8 @@ func main() {
 	var err error
 
 	switch os.Args[1] {
+	case "init":
+		err = cmdInit(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "check":
@@ -62,6 +64,8 @@ func usageText() string {
 	return fmt.Sprintf(`crawlping %s - submit URLs to IndexNow from your own machine
 
 Usage:
+  crawlping init         [-dir path] [-host hostname] [-shape docker|binary|tunnel]
+                                          write config.yaml and <key>.txt, then print the next steps
   crawlping serve        [-config path]   run the HTTP API
   crawlping check        [-config path]   verify every configured key file
   crawlping healthcheck  [-addr host:port] [-config path]
@@ -69,6 +73,13 @@ Usage:
   crawlping version
 
 The config path defaults to $%s, then ./config.yaml.
+
+init needs -host; every other flag has a default. It refuses to replace an
+existing config.yaml or key file without -force. -shape decides the one line
+that costs the most to get wrong: docker (the default) binds 0.0.0.0:8080,
+because Docker forwards a published port to the container's eth0 and never to
+its loopback; binary and tunnel bind 127.0.0.1:8080, where no port is
+published.
 
 healthcheck precedence: -addr wins when it is given. The address is dialed as
 is and the config file is never read, so a healthcheck still describes the

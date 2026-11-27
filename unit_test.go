@@ -155,7 +155,7 @@ func TestLocalHealthURL(t *testing.T) {
 
 func TestUsageMentionsEveryCommand(t *testing.T) {
 	// A cheap guard that the help text keeps up with the subcommands.
-	text := "serve check healthcheck version"
+	text := "init serve check healthcheck version"
 	for _, command := range strings.Fields(text) {
 		if !strings.Contains(usageText(), command) {
 			t.Fatalf("usage text does not mention %q", command)
