@@ -37,6 +37,10 @@ func main() {
 		err = cmdInit(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "site":
+		err = cmdSite(os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:], os.Stdout)
 	case "healthcheck":
@@ -68,7 +72,13 @@ Usage:
   crawlping init         [-dir path] [-host hostname] [-shape docker|binary|tunnel]
                                           write config.yaml and <key>.txt, then print the next steps
   crawlping serve        [-config path]   run the HTTP API
+  crawlping site add     [-host hostname] [-key key] [-token token] [-keydir path] [-config path]
+                                          add a site, generate its key, write the key file
+  crawlping site rm      -host hostname [-config path]
+                                          remove a site; the key file is left alone
+  crawlping site list    [-config path]   every configured site, token masked
   crawlping check        [-config path]   verify every configured key file
+  crawlping doctor       [-config path]   the whole deployment: config, port, egress, keys
   crawlping healthcheck  [-addr host:port] [-config path]
                                           exit 0 when the local API answers
   crawlping version
@@ -82,6 +92,17 @@ because Docker forwards a published port to the container's eth0 and never to
 its loopback; binary and tunnel bind 127.0.0.1:8080, where no port is
 published.
 
+serve reloads its config on SIGHUP, which is how a site is added without a
+restart: crawlping site add -host example.com, then docker kill -s HUP crawlping.
+A config that does not load is refused and the running one keeps serving.
+
+site add writes the config atomically and keeps its mode, generates the key and
+the token when they are not given, and writes <key>.txt next to the config. It
+runs as the uid that owns the file - in a container that means
+--user "$(id -u):$(id -g)" - or what it writes will not be readable by the
+service. The key file still has to be deployed to the site: that is the one step
+no command here can do for you.
+
 healthcheck precedence: -addr wins when it is given. The address is dialed as
 is and the config file is never read, so a healthcheck still describes the
 running process after someone edits config.yaml underneath it. Without -addr
@@ -92,7 +113,15 @@ the listen address comes from the config file.
 func cmdServe(args []string) error {
 	configPath := configFlag("serve", args)
 
-	cfg, err := loadConfig(configPath)
+	// Read and parse separately, so the bytes this process was built from are in
+	// hand: a reload compares them against the file, which is how a container
+	// reading a pinned inode gets told what is wrong instead of reloading the
+	// same config in silence.
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg, err := parseConfig(raw)
 	if err != nil {
 		return err
 	}
@@ -100,10 +129,35 @@ func cmdServe(args []string) error {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
 
-	srv := newServer(cfg, newIndexNowClient(cfg.IndexNowEndpoint), log)
+	srv := newServerWithSource(cfg, newIndexNowClient(cfg.IndexNowEndpoint), log, raw)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// SIGHUP reloads the config file, which is how a site is added without a
+	// restart. It is deliberately not a file watcher: a signal is something the
+	// operator sends on purpose, and it arrives after the write is complete
+	// rather than in the middle of one. `docker kill -s HUP crawlping` is the
+	// whole interface.
+	hangup := make(chan os.Signal, 1)
+	signal.Notify(hangup, syscall.SIGHUP)
+	defer signal.Stop(hangup)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hangup:
+				if err := srv.reload(ctx, configPath); err != nil {
+					// The running config keeps serving: a typo in a file that a
+					// Worker is already calling must not be able to take the API
+					// down. The error names the file and what is wrong with it.
+					log.Error("config reload failed, keeping the running config", "error", err)
+				}
+			}
+		}
+	}()
 
 	// Addr is deliberately absent: the socket comes from net.Listen below, so
 	// there is one place that decides what is bound and one place that can fail.
