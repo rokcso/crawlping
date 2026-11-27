@@ -471,6 +471,24 @@ func printSiteAdded(w io.Writer, configPath, keyPath string, site Site, total in
 	fmt.Fprintf(w, "         stored in %s; `crawlping site list` shows its last four characters\n", configPath)
 
 	fmt.Fprintf(w, "\n  apply  docker kill -s HUP crawlping     (no restart, no dropped request)\n")
+
+	// How much of the engine's concurrency one site may hold is decided when the
+	// process starts, not by the reload: it is the width of a semaphore that may
+	// already have slots held. A service that booted with a single site therefore
+	// keeps all of them after this command hands it a second one. The running
+	// process says so in its own log, but the person running this command is the
+	// one who never reads that log, so it is said here as well.
+	//
+	// Only this transition says anything: the share is the whole instance cap for
+	// one site and half of it for any number above, so a third site changes
+	// nothing. The sentence is conditional because this command cannot see what
+	// the running process started with - only what the file holds now.
+	if total == 2 {
+		fmt.Fprintf(w, "  share  a service that started with one site keeps all %d engine calls in\n", maxInFlightEngineCalls)
+		fmt.Fprintf(w, "         flight per host; two sites is documented as %d. The reload above applies\n", perHostInFlightLimit(total))
+		fmt.Fprintf(w, "         the site list - a restart is what applies the share.\n")
+	}
+
 	fmt.Fprintf(w, "  check  crawlping check -config %s\n", configPath)
 	fmt.Fprintf(w, "\n  Nothing is submitted for %s until its caller does. The key file above only\n", site.Host)
 	fmt.Fprintf(w, "  has to be live before the first submission, not before this command.\n")

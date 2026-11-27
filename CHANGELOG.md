@@ -97,7 +97,8 @@ rename, so a `SIGHUP` reload reads the old inode and the site count never change
   without losing them. So a deployment that starts with one site keeps all 8 slots
   per host after `site add` adds a second, where the documented split for two
   sites is 4. The reload logs a warning naming the share that is running and the
-  one a restart would apply: restart if you want the split.
+  one a restart would apply, and `crawlping site add` says the same thing when it
+  adds the second site: restart if you want the split.
 
 ### Fixed
 

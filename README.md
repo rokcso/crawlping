@@ -232,7 +232,8 @@ inheriting an old `verified`. And the per-site engine share stays the one the
 process started with, because it is the width of a semaphore that may already
 have slots held: a reload that changes the site count enough to imply a different
 share logs a warning naming both numbers, and a restart is what applies the one
-the current count implies.
+the current count implies. `site add` says the same thing when it adds the second
+site, because that is the one place it changes.
 
 **Reloading only works if the config is mounted as a directory.** A bind mount of
 a single file pins the inode the container started with: `site add` writes through

@@ -389,6 +389,50 @@ func TestSiteAddNamesTheKeyLocation(t *testing.T) {
 	}
 }
 
+func TestSiteAddExplainsTheShareWhenItAddsTheSecondSite(t *testing.T) {
+	// Adding the second site is the only moment the per-site engine share would
+	// change, and the share is decided when the service starts: the reload this
+	// command prints applies the site list, not the share. The operator running
+	// this is the one who will not read the running process's warning, so the
+	// caveat belongs here too.
+	path := oneSiteConfigPath(t)
+
+	var out bytes.Buffer
+	if err := runSiteAdd(&out, siteAddOptions{configPath: path, host: "shop.example.org"}); err != nil {
+		t.Fatalf("site add: %v", err)
+	}
+
+	printed := out.String()
+	for _, want := range []string{
+		"share",
+		fmt.Sprintf("keeps all %d engine calls", maxInFlightEngineCalls),
+		fmt.Sprintf("documented as %d", perHostInFlightLimit(2)),
+		"restart is what applies the share",
+	} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("the output never says %q:\n%s", want, printed)
+		}
+	}
+}
+
+func TestSiteAddRepeatsTheShareOnlyForTheSecondSite(t *testing.T) {
+	// One site holds the whole instance cap and any number above one holds half
+	// of it, so a third site changes nothing. Saying it anyway is the kind of
+	// noise that trains a reader to skip the block that follows.
+	for _, total := range []int{1, 3} {
+		var out bytes.Buffer
+		printSiteAdded(&out, "config.yaml", "/tmp/"+testFixtureKey()+".txt", Site{
+			Host:        "shop.example.org",
+			IndexNowKey: testFixtureKey(),
+			KeyLocation: "https://shop.example.org/" + testFixtureKey() + ".txt",
+		}, total, true)
+
+		if strings.Contains(out.String(), "share") {
+			t.Fatalf("%d sites repeated the share caveat:\n%s", total, out.String())
+		}
+	}
+}
+
 func TestSiteSubcommandNames(t *testing.T) {
 	if err := cmdSite(nil); err == nil {
 		t.Fatal("site with no subcommand succeeded")
