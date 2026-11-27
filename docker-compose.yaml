@@ -12,14 +12,31 @@
 #
 # config.example.yaml ships this shape, so `cp config.example.yaml config.yaml`
 # then `docker compose up -d` is a working install with nothing else to change.
+# config.example.yaml ships this shape, so `cp config.example.yaml config.yaml`
+# then `docker compose up -d` is a working install with nothing else to change.
+#
+# `user` is not optional. The image runs as a nonroot uid, the config file holds
+# tokens and is created 0600, and a bind mount keeps the file's real owner and
+# mode on Linux. Without this line the container cannot read the file it was
+# given: it answers "read config: permission denied" and restart-loops while the
+# file sits right there. Running as *your* uid makes the owner of the file and
+# the user of the process the same, which is the only version of this that does
+# not need a chown. Change the numbers to `id -u` and `id -g`. Same for
+# `site add`: run it with --user "$(id -u):$(id -g)" so the file it writes is
+# still readable by the service.
 services:
   crawlping:
     image: ghcr.io/rokcso/crawlping:latest
     restart: unless-stopped
+    user: "1000:1000"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./config.yaml:/etc/crawlping/config.yaml:ro
+      # The directory, not the file: a single-file mount pins the inode the
+      # container started with, so `site add` (an atomic rename) would be
+      # invisible until a restart, and `docker kill -s HUP` would reload
+      # the bytes it already had.
+      - ./:/etc/crawlping:ro
 
 # Alternative shape: no published port at all, reached over a Cloudflare
 # Tunnel. Replace the whole `services:` block above with the block below and
@@ -27,13 +44,19 @@ services:
 # crawlping joins cloudflared's network namespace, so the tunnel's own
 # `http://127.0.0.1:8080` is crawlping's loopback, with no port published.
 #
+# HTTP/Tunnel: add `user: "1000:1000"` here too, for the reason above.
 # services:
 #   crawlping:
 #     image: ghcr.io/rokcso/crawlping:latest
 #     restart: unless-stopped
+#     user: "1000:1000"
 #     network_mode: service:cloudflared
 #     volumes:
-#       - ./config.yaml:/etc/crawlping/config.yaml:ro
+#       # The directory, not the file: a single-file mount pins the inode the
+      # container started with, so `site add` (an atomic rename) would be
+      # invisible until a restart, and `docker kill -s HUP` would reload
+      # the bytes it already had.
+      - ./:/etc/crawlping:ro
 #
 #   cloudflared:
 #     image: cloudflare/cloudflared:latest

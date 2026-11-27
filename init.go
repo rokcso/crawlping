@@ -215,7 +215,13 @@ func runInit(w io.Writer, opts initOptions) error {
 // initShapeFor returns what one deployment shape demands, with the config path
 // already substituted into its commands.
 func initShapeFor(shape, configPath string) (initShape, error) {
-	mount := fmt.Sprintf(`-v "%s:/etc/crawlping/config.yaml:ro"`, configPath)
+	// The directory, not the file. A single-file bind mount pins the inode the
+	// container started with, so an atomic replace on the host - which is what
+	// `site add` does - is invisible inside it until a restart, and the reload
+	// that exists to avoid that restart reloads the stale bytes. The in-container
+	// path is unchanged, so every command below still names the same file.
+	dir := filepath.Dir(configPath)
+	mount := fmt.Sprintf(`-v "%s:/etc/crawlping:ro"`, dir)
 
 	switch shape {
 	case shapeDocker:
@@ -232,6 +238,7 @@ func initShapeFor(shape, configPath string) (initShape, error) {
 			},
 			start: []string{
 				"docker run -d --name crawlping --restart unless-stopped \\",
+				"    --user \"$(id -u):$(id -g)\" \\",
 				"    -p 127.0.0.1:8080:" + initListenPort + " \\",
 				"    " + mount + " \\",
 				"    ghcr.io/rokcso/crawlping",
@@ -239,9 +246,13 @@ func initShapeFor(shape, configPath string) (initShape, error) {
 			startNote: []string{
 				"-p 127.0.0.1:8080:8080 keeps the API reachable from this machine only.",
 				"Write -p 8080:8080 only if other machines really should reach it.",
+				"--user runs the container as you. The image's own uid is not yours, and",
+				"config.yaml is 0600: without this flag the container cannot read the file",
+				"and restart-loops on \"permission denied\". Use `id -u`/`id -g` of the",
+				"account that owns the config, which is the account running this command.",
 			},
 			check: []string{
-				"docker run --rm \\",
+				"docker run --rm --user \"$(id -u):$(id -g)\" \\",
 				"    " + mount + " \\",
 				"    ghcr.io/rokcso/crawlping check -config /etc/crawlping/config.yaml",
 			},
@@ -275,6 +286,7 @@ func initShapeFor(shape, configPath string) (initShape, error) {
 			},
 			start: []string{
 				"docker run -d --name crawlping --restart unless-stopped \\",
+				"    --user \"$(id -u):$(id -g)\" \\",
 				"    --network container:cloudflared \\",
 				"    " + mount + " \\",
 				"    ghcr.io/rokcso/crawlping",
@@ -282,9 +294,11 @@ func initShapeFor(shape, configPath string) (initShape, error) {
 			startNote: []string{
 				"cloudflared's http://127.0.0.1:" + initListenPort + " is this container's loopback,",
 				"so point the tunnel's public hostname at it and publish no port.",
+				"--user runs the container as you, which is what makes a 0600 config",
+				"readable to it: the image's own uid is not yours.",
 			},
 			check: []string{
-				"docker run --rm \\",
+				"docker run --rm --user \"$(id -u):$(id -g)\" \\",
 				"    " + mount + " \\",
 				"    ghcr.io/rokcso/crawlping check -config /etc/crawlping/config.yaml",
 			},

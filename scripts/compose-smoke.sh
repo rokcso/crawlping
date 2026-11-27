@@ -106,9 +106,15 @@ docker build -t "$image" . || fail "docker build failed"
 printf 'starting %s, publish 127.0.0.1:%s->%s, listen %s\n' \
 	"$container" "$host_port" "$container_port" "$listen"
 container_started=1
+# --user, because the config is 0600 and the image runs as a nonroot uid: a bind
+# mount keeps the file's real owner on Linux, so without this the container
+# cannot read the file it was handed and restart-loops on "permission denied".
+# Running as the invoking uid is the same thing the README tells an operator to
+# do, so this exercises the documented path rather than a convenient variant.
 docker run -d --name "$container" \
+	--user "$(id -u):$(id -g)" \
 	-p "127.0.0.1:${host_port}:${container_port}" \
-	-v "${config_file}:/etc/crawlping/config.yaml:ro" \
+	-v "${tmpdir}:/etc/crawlping:ro" \
 	"$image" >/dev/null || fail "docker run failed"
 
 health_url="http://127.0.0.1:${host_port}/health"
@@ -160,4 +166,38 @@ docker run --rm --network "container:${container}" "$image" \
 	healthcheck -addr "127.0.0.1:${container_port}" -config "/nonexistent/config.yaml" >/dev/null 2>&1 ||
 	fail "healthcheck -addr 127.0.0.1:${container_port} failed inside the container network"
 
-printf 'PASS: default deployment path reachable and correct (127.0.0.1:%s/health, container healthy)\n' "$host_port"
+# The reload path, end to end. This is the assembly version of a trap that no
+# unit test can see: a config mounted as a single file keeps the inode the
+# container started with, so replacing it on the host is invisible inside and
+# SIGHUP reloads the bytes it already had - silently. `site add` then looks like
+# it worked. Mounting the directory is what makes the replace visible, and this
+# is the assertion that keeps the shipped shape doing that.
+second_host="smoke-$$.example.org"
+printf '\nadding %s to the mounted config, then reloading over docker kill -HUP\n' "$second_host"
+docker run --rm --user "$(id -u):$(id -g)" \
+	-v "${tmpdir}:/work" -w /work \
+	--entrypoint /crawlping "$image" site add -host "$second_host" >/dev/null || fail "site add failed"
+
+docker kill -s HUP "$container" >/dev/null || fail "docker kill -s HUP failed"
+
+# The reload happens in the signal handler, so the answer is not immediate and
+# there is no event to wait on: poll the count the new site changes.
+reload_deadline=$(($(date +%s) + 15))
+sites_now=0
+while :; do
+	sites_now=$(curl -sS --max-time 2 "$health_url" 2>/dev/null | sed -n 's/.*"sites":\([0-9]*\).*/\1/p')
+	if [ "${sites_now:-0}" -ge 2 ] 2>/dev/null; then
+		break
+	fi
+	if [ "$(date +%s)" -ge "$reload_deadline" ]; then
+		break
+	fi
+	sleep 1
+done
+
+if [ "${sites_now:-0}" -lt 2 ] 2>/dev/null; then
+	describe_failure
+	fail "after site add and SIGHUP, /health still reports ${sites_now:-0} sites: the container is reading a config the host already replaced"
+fi
+
+printf 'PASS: default deployment path reachable and correct (127.0.0.1:%s/health, container healthy, reload picked up a new site)\n' "$host_port"
