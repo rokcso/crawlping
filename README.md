@@ -101,10 +101,21 @@ listen: "0.0.0.0:8080"        # all interfaces *inside* the container
 ```bash
 docker run -d --name crawlping \
   --restart unless-stopped \
+  --user "$(id -u):$(id -g)" \
   -p 127.0.0.1:8080:8080 \
-  -v "$PWD/config.yaml:/etc/crawlping/config.yaml:ro" \
+  -v "$PWD:/etc/crawlping:ro" \
   ghcr.io/rokcso/crawlping
 ```
+
+`--user` is not decoration. The image runs as its own nonroot uid, `config.yaml`
+is mode `0600`, and a bind mount keeps the file's real owner and mode on Linux -
+so a container left on the image's uid cannot read the file it was handed. It
+answers `read config: ... permission denied` and restart-loops while the file
+sits right there, and nothing in that message names the owner. Running as *your*
+uid makes the file's owner and the process's user the same, which is the only
+version of this that needs no `chown`. The same rule applies to every command
+that reads or writes the config: add `--user "$(id -u):$(id -g)"` to `check`,
+`site add` and `doctor` too.
 
 Both halves are required, and they do different jobs. `-p` forwards to the
 container's **eth0** address, never to its loopback, so a container left on
@@ -122,6 +133,9 @@ it from this machine and from nowhere else:
 ```bash
 docker compose up -d
 ```
+
+The compose file carries `user: "1000:1000"` for the reason above; change it to
+your own `id -u` and `id -g`.
 
 ### No Docker
 
@@ -152,7 +166,8 @@ This reads the config and fetches every key URL; it does not care which shape
 you deployed:
 
 ```bash
-docker run --rm -v "$PWD/config.yaml:/etc/crawlping/config.yaml:ro" \
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/etc/crawlping:ro" \
   ghcr.io/rokcso/crawlping check -config /etc/crawlping/config.yaml
 ```
 
@@ -184,6 +199,99 @@ and still be refused on the first real submission. A `403` after a green
 filter, or a country rule in front of the file - rather than the key being
 wrong, which is a live concern on Cloudflare. The only authoritative
 confirmation is the engine's own `200` or `202` on a real submission.
+
+## Adding a site
+
+One command, then one copy. A token is bound to one host, so a new site needs its
+own token and its own key file, and both are generated:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/work" -w /work \
+  ghcr.io/rokcso/crawlping site add -host shop.example.org
+```
+
+It appends the entry to `config.yaml`, writes `<key>.txt` next to it, and prints
+the one thing it cannot do: where that file has to be served. Then apply it
+without dropping a request:
+
+```bash
+docker kill -s HUP crawlping
+```
+
+`serve` reloads on SIGHUP. The listener stays up, in-flight submissions finish,
+and the counters in `/metrics` keep counting - a reload changes who may submit,
+not what already happened. A config that does not load is refused and the running
+one keeps serving, so a typo cannot take down an API a Worker is calling.
+
+**Reloading only works if the config is mounted as a directory.** A bind mount of
+a single file pins the inode the container started with: `site add` writes through
+a temporary file and a rename (so a failed edit cannot leave a truncated config),
+and the rename creates a new inode the container never sees. The signal arrives,
+the reload runs, and it reloads the bytes already in memory - so `/health` still
+reports the old site count and nothing tells you why. That is why every `-v` in
+this README mounts a directory and names the file inside it:
+
+```bash
+-v "$PWD:/etc/crawlping:ro"        # right: the directory, so a rename is visible
+-v "$PWD/config.yaml:/etc/crawlping/config.yaml:ro"   # wrong: the inode is pinned
+```
+
+A reload that reads the bytes it already had logs a warning saying exactly this,
+so a deployment that kept the old shape is told rather than left guessing.
+
+The rest of the surface:
+
+```bash
+crawlping site list                  # every site, token masked to its last four
+crawlping site rm -host shop.example.org
+```
+
+`site add` is worth reading before you trust it:
+
+| Flag | Meaning |
+|---|---|
+| `-host` | the bare hostname, as everywhere else: no scheme, port or path |
+| `-key` | reuse a key whose file is already deployed instead of generating one |
+| `-token` | set the token yourself; generated when empty |
+| `-keydir` | where `<key>.txt` goes; the config's directory by default |
+
+It edits the YAML node tree rather than re-rendering the file, so your comments
+and key order survive. It writes through a temporary file and a rename, keeps the
+mode the config already had, and reads the result back with the loader the
+service itself uses - if the edited file would not start the service, nothing is
+written and the error names the line.
+
+What it does not do is deploy the key file. That file has to reach the site's own
+origin, and only you can do that.
+
+## Checking a whole deployment
+
+`check` answers one question - is each key file right. `doctor` answers whether
+the deployment can work at all, and it is read-only: it never submits anything,
+so it is safe to run against a live instance.
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/etc/crawlping:ro" \
+  ghcr.io/rokcso/crawlping doctor -config /etc/crawlping/config.yaml
+```
+
+```
+ok    config   /etc/crawlping/config.yaml, 2 sites, endpoint https://api.indexnow.org/indexnow
+ok    listen   0.0.0.0:8080 is answering /health 200; the address is held by this instance
+ok    engine   api.indexnow.org:443 reachable in 41ms
+ok    key      example.com   https://example.com/<key>.txt
+FAIL  key      shop.example.org  https://shop.example.org/<key>.txt
+      200 but text/html, which is a page, not a key file
+      the site is answering for a path it does not have; publish <key>.txt at the host root
+```
+
+The last block is the failure that looks like success: a static site with a
+catch-all route answers `200` for every path, so fetching the key URL and seeing
+`200` is not evidence. The engine reads that page and refuses the key. `doctor`
+compares the body and the content type, so this is a `FAIL` with a cause rather
+than a green check followed by a `403`.
 
 ## API
 

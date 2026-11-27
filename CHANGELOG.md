@@ -27,6 +27,65 @@ Five rules, and they are the whole convention:
 
 ## [Unreleased]
 
+### Breaking
+
+- **The container has to run as your uid, and the config has to be mounted as a
+directory.** Both are new requirements, and both fail quietly if skipped. The
+image runs as its own nonroot uid while `config.yaml` is mode `0600` and a bind
+mount keeps its real owner on Linux, so the process cannot read the file it was
+handed: it answers `read config: ... permission denied` and restart-loops while
+the file sits right there. And a single-file mount hides `site add`'s atomic
+rename, so a `SIGHUP` reload reads the old inode and the site count never changes.
+
+  ```diff
+  -  -v "$PWD/config.yaml:/etc/crawlping/config.yaml:ro"
+  +  -v "$PWD:/etc/crawlping:ro"
+  +  --user "$(id -u):$(id -g)"
+  ```
+
+  The in-container path is unchanged, so no other flag moves. Add `user:
+  "1000:1000"` to compose. Then `chown` the config to your own uid and drop any
+  `chown 65532` you added to work around the old failure. Restarting once here is
+  fine; the reload matters after this point. No API change: `/submit`, `/health`
+  and `/metrics` are as v0.2.0 left them.
+
+### Added
+
+- `crawlping site add -host ...` generates the key and token, appends the entry,
+  writes `<key>.txt` beside it, and prints the one step it cannot do: serve that
+  file from the site. `-key` reuses a key whose file is already deployed,
+  `-token` sets the token yourself, `-keydir` moves the key file. It edits the
+  YAML node tree rather than re-rendering, so comments and key order survive; it
+  writes through a temporary file and a rename, keeps the mode the config already
+  had, and reads the result back with the loader the service itself uses.
+- `crawlping site rm -host ...` and `crawlping site list` (token masked to its last
+  four characters). `rm` refuses the last site, because a config with none does
+  not load.
+- `SIGHUP` reloads the config: `docker kill -s HUP crawlping` applies a new site
+  list with no restart. The listener stays up, in-flight submissions finish, and
+  the counters keep counting. A config that does not load is refused and the
+  running one keeps serving. Only hosts the previous config did not carry are
+  key-checked, so a reload cannot replace the engine's own `200` verdict with a
+  key-file fetch that happens to be timing out.
+- `crawlping doctor` answers whether the deployment can work at all, read-only, so
+  it is safe against a live instance. It checks the config, that the listen
+  address is free or already answered by this instance, that the engine is
+  reachable by DNS + TCP + TLS, and one line per key file. It separates "the origin
+  answered 200 with its fallback page" from "the file holds the wrong key".
+- Every documented `docker run` carries `--user "$(id -u):$(id -g)"`, and the
+  compose file carries `user:`.
+
+### Fixed
+
+- A container could not read the config it was given, and the documented `init`
+  and Quick start paths both produced it. Running as the invoking uid makes the
+  owner and the process the same; `init` now prints that flag and says why.
+- A reload could read an inode the host had already replaced, silently: the signal
+  arrived, the reload ran, the log said `config reloaded`, and the site count
+  never changed. Every documented mount is a directory now, the smoke test asserts
+  a replaced config reaches the running process, and a reload that reads bytes it
+  already had logs a warning naming the cause.
+
 ## [0.2.0] - 2026-11-27
 
 ### Breaking
