@@ -14,7 +14,9 @@ listen: "0.0.0.0:8080"
 # documented reason to submit a whole site at once: IndexNow's own ceiling is
 # 10,000 URLs per request, and a body that carries them needs about 256 bytes per
 # URL. The two are one decision - a body too small for the count makes every full
-# batch a 413 - so a mismatched pair is refused at startup rather than later.
+# batch a 413 - so a mismatched pair is refused at startup rather than later. The
+# resubmission window's table grows with max_urls_per_request, so one full batch
+# is always remembered, and it never shrinks back.
 # limits:
 #   max_urls_per_request: 100        # 1 to 10000
 #   max_body_bytes: 65536            # at least max_urls_per_request * 16, at most 8 MiB

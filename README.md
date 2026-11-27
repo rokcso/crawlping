@@ -108,14 +108,14 @@ docker run -d --name crawlping \
 ```
 
 `--user` is not decoration. The image runs as its own nonroot uid, `config.yaml`
-is mode `0600`, and a bind mount keeps the file's real owner and mode on Linux -
-so a container left on the image's uid cannot read the file it was handed. It
-answers `read config: ... permission denied` and restart-loops while the file
-sits right there, and nothing in that message names the owner. Running as *your*
-uid makes the file's owner and the process's user the same, which is the only
-version of this that needs no `chown`. The same rule applies to every command
-that reads or writes the config: add `--user "$(id -u):$(id -g)"` to `check`,
-`site add` and `doctor` too.
+is mode `0600` (a fact `doctor` now checks rather than assumes), and a bind mount
+keeps the file's real owner and mode on Linux - so a container left on the
+image's uid cannot read the file it was handed. It answers `read config: ...
+permission denied` and restart-loops while the file sits right there, and nothing
+in that message names the owner. Running as *your* uid makes the file's owner and
+the process's user the same, which is the only version of this that needs no
+`chown`. The same rule applies to every command that reads or writes the config:
+add `--user "$(id -u):$(id -g)"` to `check`, `site add` and `doctor` too.
 
 Both halves are required, and they do different jobs. `-p` forwards to the
 container's **eth0** address, never to its loopback, so a container left on
@@ -224,6 +224,16 @@ and the counters in `/metrics` keep counting - a reload changes who may submit,
 not what already happened. A config that does not load is refused and the running
 one keeps serving, so a typo cannot take down an API a Worker is calling.
 
+Three things do move with the new config. The resubmission window's table grows
+to `limits.max_urls_per_request` if the reload raised it, so one full batch is
+still remembered. A host the new list no longer carries loses its recorded key
+verdict, so a host that is added back later is checked again instead of
+inheriting an old `verified`. And the per-site engine share stays the one the
+process started with, because it is the width of a semaphore that may already
+have slots held: a reload that changes the site count enough to imply a different
+share logs a warning naming both numbers, and a restart is what applies the one
+the current count implies.
+
 **Reloading only works if the config is mounted as a directory.** A bind mount of
 a single file pins the inode the container started with: `site add` writes through
 a temporary file and a rename (so a failed edit cannot leave a truncated config),
@@ -268,8 +278,9 @@ origin, and only you can do that.
 ## Checking a whole deployment
 
 `check` answers one question - is each key file right. `doctor` answers whether
-the deployment can work at all, and it is read-only: it never submits anything,
-so it is safe to run against a live instance.
+the deployment can work at all, including whether the config file's mode keeps its
+tokens private, and it is read-only: it never submits anything, so it is safe to
+run against a live instance.
 
 ```bash
 docker run --rm --user "$(id -u):$(id -g)" \
@@ -279,6 +290,7 @@ docker run --rm --user "$(id -u):$(id -g)" \
 
 ```
 ok    config   /etc/crawlping/config.yaml, 2 sites, endpoint https://api.indexnow.org/indexnow
+ok    mode     0600, readable only by the owner
 ok    listen   0.0.0.0:8080 is answering /health 200; the address is held by this instance
 ok    engine   api.indexnow.org:443 reachable in 41ms
 ok    key      example.com   https://example.com/<key>.txt
@@ -286,6 +298,14 @@ FAIL  key      shop.example.org  https://shop.example.org/<key>.txt
       200 but text/html, which is a page, not a key file
       the site is answering for a path it does not have; publish <key>.txt at the host root
 ```
+
+The `mode` line answers a question nothing else could: `config.yaml` holds every
+site's bearer token, and `init` writes it `0600`, but an editor that replaces the
+file, a `cp` from a backup or a `chmod -R` leaves it `0644` and nothing used to
+notice. A file the group or anyone else can read is a `FAIL` naming the mode,
+with `chmod 600` in the note under it, and it exits non-zero. `0400` and `0700`
+pass: only the group and other bits are judged, because those modes are private
+too.
 
 The last block is the failure that looks like success: a static site with a
 catch-all route answers `200` for every path, so fetching the key URL and seeing
@@ -360,8 +380,9 @@ git tag v0.2.0 && git push origin v0.2.0
 
 `.github/workflows/release.yml` then runs the tests, cross-compiles five
 binaries (`linux`/`darwin`/`windows` x `amd64`/`arm64` as applicable), builds and
-pushes a multi-arch image tagged `0.1.0`, `0.1` and `latest`, and creates the
-GitHub release with the archives and `checksums.txt` attached.
+pushes a multi-arch image tagged with the tag's own version, its `major.minor`
+and `latest`, and creates the GitHub release with the archives and `checksums.txt`
+attached. `v0.2.0` therefore publishes `0.2.0`, `0.2` and `latest`.
 
 A tag containing a hyphen (`v0.2.0-rc1`) is published as a prerelease and does
 not move `latest`.

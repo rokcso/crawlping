@@ -12,8 +12,6 @@
 #
 # config.example.yaml ships this shape, so `cp config.example.yaml config.yaml`
 # then `docker compose up -d` is a working install with nothing else to change.
-# config.example.yaml ships this shape, so `cp config.example.yaml config.yaml`
-# then `docker compose up -d` is a working install with nothing else to change.
 #
 # `user` is not optional. The image runs as a nonroot uid, the config file holds
 # tokens and is created 0600, and a bind mount keeps the file's real owner and
@@ -53,10 +51,10 @@ services:
 #     network_mode: service:cloudflared
 #     volumes:
 #       # The directory, not the file: a single-file mount pins the inode the
-      # container started with, so `site add` (an atomic rename) would be
-      # invisible until a restart, and `docker kill -s HUP` would reload
-      # the bytes it already had.
-      - ./:/etc/crawlping:ro
+#       # container started with, so `site add` (an atomic rename) would be
+#       # invisible until a restart, and `docker kill -s HUP` would reload
+#       # the bytes it already had.
+#       - ./:/etc/crawlping:ro
 #
 #   cloudflared:
 #     image: cloudflare/cloudflared:latest

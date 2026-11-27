@@ -113,15 +113,25 @@ engine throttles it, not the caller:
 - **10 requests back to back per host**, then one more per second. The burst and
 the refill are per host, so one noisy site cannot silence another.
 - **8 engine requests in flight at once**, across every site, and **at most 4 of
-them for one site** when this instance serves more than one. A request that
-finds no free slot waits up to 2 seconds for one, then gives up. The two
+them for one site** when this instance was started with more than one. A request
+that finds no free slot waits up to 2 seconds for one, then gives up. The two
 refusals are reported separately because they ask for different things: the
 `detail` says whether this site had used its own share or the instance had used
 its, so the caller knows whether to slow one site down or all of them.
-- A config with a **single site keeps all 8**. With one host a per-host cap could
-only duplicate the global one, and halving it would throw away half the engine
-concurrency the deployment is allowed, for a starvation problem that cannot
-exist with one site.
+- An instance **started with a single site keeps all 8**. With one host a per-host
+cap could only duplicate the global one, and halving it would throw away half the
+engine concurrency the deployment is allowed, for a starvation problem that
+cannot exist with one site.
+
+Which of those two applies is decided from the **site count at startup**, because
+the share is the width of a semaphore that may already have slots held, and a
+channel cannot be widened without losing them. A reload that adds the second site
+keeps the 8 it started with and logs a warning naming both numbers; a restart
+applies the 4 the current count implies.
+
+A refusal that took the 2 seconds is still written: the server's own write budget
+(40 seconds) covers the body read, the slot wait and the engine call together, so
+the answer reaches the caller instead of the connection being closed under it.
 
 The per-site share is a ceiling, not a reservation: a second site that is idle
 still costs the busy one its other four slots. That is deliberate. Concurrency is
@@ -165,7 +175,9 @@ fits.
 
 Raising the count also grows the resubmission window's table, so one full batch
 is always remembered; a raised count whose URLs the window then forgot would
-resubmit every one of them immediately.
+resubmit every one of them immediately. That holds across a reload as well as at
+startup - a config reloaded with a larger count grows the table the process is
+running with - and the table never shrinks back when the count does.
 
 ### The resubmission window
 
@@ -181,14 +193,20 @@ timer was previously paying for each poll.
 - The window is per site host and per URL, keyed on the URL that was actually
 sent, after cleaning: fragments stripped, duplicates collapsed. One site cannot
 suppress another's URL.
-- A URL is remembered only when the engine accepted the batch that carried it. A
-failed submission leaves you a retry to make, and that retry is not suppressed.
+- A URL is remembered only when the engine accepted the batch that carried it.
+While that batch is in flight the URL is claimed, so a concurrent request
+carrying the same one skips it instead of sending it twice; the claim is given
+back when the batch is not accepted, because a failed submission leaves you a
+retry to make and that retry is not suppressed.
 - A batch in which everything is inside the window is **not** an error: 200,
 `ok: true`, `submitted: 0`, `skipped: n`, and no `reason`. The engine is not
 called.
-- The table is bounded (4096 URLs of up to 2048 bytes each) so a caller cannot
-grow this process's memory with arbitrary URLs. Past that the oldest entry is
-forgotten, which costs at most one early resubmission.
+- The table is bounded by 4096 URLs of up to 2048 bytes each, or by
+`limits.max_urls_per_request` when that is larger, because one full batch has to
+be rememberable. A caller cannot grow this process's memory with arbitrary URLs
+that way. Past the bound the oldest entry is forgotten, which costs at most one
+early resubmission, and the bound only ever grows: a table sized for a large
+count stays that size if the count goes back down.
 
 The window is a quota guard, not a scheduler: it never sends anything later on
 your behalf, and it does not decide whether a page changed. Deduplication inside
@@ -329,7 +347,13 @@ crawlping_key_state{host}                                    gauge
 ```
 
 `kind` is `throttled` (this instance's own rate bucket) or `overloaded` (no
-engine slot). `crawlping_key_state` is `0` pending, `1` verified, `2` failed, the
+engine slot). `crawlping_guard_refusals_total` is a breakdown of
+`crawlping_submissions_total`, not a total beside it: a request either guard
+refuses is one submission, one `reason` and one `kind`, with no engine status
+and no latency sample, because nothing was sent. A scrape that adds the two
+families together counts those requests twice.
+
+`crawlping_key_state` is `0` pending, `1` verified, `2` failed, the
 same three states `/health` reports. A family with no observation yet carries its
 `HELP` and `TYPE` lines and no series, so a scrape before the first submission is
 not an error.

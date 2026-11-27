@@ -48,6 +48,14 @@ rename, so a `SIGHUP` reload reads the old inode and the site count never change
   `chown 65532` you added to work around the old failure. Restarting once here is
   fine; the reload matters after this point. No API change: `/submit`, `/health`
   and `/metrics` are as v0.2.0 left them.
+- **`crawlping_submissions_total` counts guard refusals now.** A request the rate
+  bucket or the concurrency guard refused is one submission, one `reason`
+  (`throttled` or `overloaded`) and one guard `kind`, so
+  `crawlping_guard_refusals_total` is a breakdown of `submissions_total` rather
+  than a total beside it. A dashboard that added the two families together counts
+  those requests twice from this version on: read the submissions family alone.
+  Those refusals carry no engine status and no latency sample, because nothing was
+  sent.
 
 ### Added
 
@@ -72,8 +80,24 @@ rename, so a `SIGHUP` reload reads the old inode and the site count never change
   address is free or already answered by this instance, that the engine is
   reachable by DNS + TCP + TLS, and one line per key file. It separates "the origin
   answered 200 with its fallback page" from "the file holds the wrong key".
+- `crawlping doctor` checks the mode of the config file, which holds every site's
+  bearer token. An editor that replaces the file, a `cp` from a backup or a
+  `chmod -R` leaves it `0644` and nothing used to notice: the line reads
+  `ok    mode     0600, readable only by the owner`, or `FAIL` naming the mode
+  with `chmod 600` under it, and a failure exits non-zero. `0400` and `0700` pass
+  too, because only the group and other bits are judged.
 - Every documented `docker run` carries `--user "$(id -u):$(id -g)"`, and the
   compose file carries `user:`.
+
+### Changed
+
+- The per-site engine share is decided once, from the site count at startup, and a
+  reload deliberately keeps the share it is running with - the share is the width
+  of a semaphore that may already have slots held, and it cannot be resized
+  without losing them. So a deployment that starts with one site keeps all 8 slots
+  per host after `site add` adds a second, where the documented split for two
+  sites is 4. The reload logs a warning naming the share that is running and the
+  one a restart would apply: restart if you want the split.
 
 ### Fixed
 
@@ -85,6 +109,26 @@ rename, so a `SIGHUP` reload reads the old inode and the site count never change
   never changed. Every documented mount is a directory now, the smoke test asserts
   a replaced config reaches the running process, and a reload that reads bytes it
   already had logs a warning naming the cause.
+- A reload that raised `limits.max_urls_per_request` left the resubmission
+  window's table at the size the process started with, so one full batch could be
+  larger than what the window could remember and the URLs it could not hold were
+  sent again on the next attempt. The table grows to the new count now, and never
+  shrinks back when the count does.
+- Two concurrent batches could send the same URL twice: both read "not in the
+  window" before either had written anything, so both spent crawl quota on it. A
+  URL is claimed while its batch is in flight now, so the second request skips it,
+  and the claim is given back when the batch is not accepted, so a failed
+  submission still leaves your retry unsuppressed.
+- A host removed from the config and added back later inherited its old key
+  verdict: it came back `verified` with an old `checked_at` without anything
+  having checked it. A host the new config no longer lists loses its record now,
+  so a re-added one starts `pending` and has its key file checked again.
+- The server's write budget could close the connection before the slowest
+  legitimate answer was written. A body read (15s), a wait for an engine slot
+  (2s) and the engine call (15s) come to 32s, and the budget was 30s, so an
+  `overloaded` or `engine_error` answer the caller could act on arrived as a
+  dropped connection. It is 40s now, and `timeout_test.go` keeps it above that
+  sum.
 
 ## [0.2.0] - 2026-11-27
 
