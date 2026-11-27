@@ -68,9 +68,10 @@ const (
 	rateRefillInterval = time.Second
 	// maxInFlightEngineCalls is how many engine requests may be open at once,
 	// across every site, so a burst on one host cannot exhaust sockets either.
+	// One host may hold at most perHostInFlightLimit of them.
 	maxInFlightEngineCalls = 8
-	// inFlightWait is how long a submission waits for a free slot before it is
-	// told the instance is busy.
+	// inFlightWait is how long a submission waits for its slots - one for the
+	// site, then one for the instance - before it is told which cap it hit.
 	inFlightWait = 2 * time.Second
 	// busyRetryAfter is the retry hint an overloaded answer carries.
 	busyRetryAfter = time.Second
@@ -169,6 +170,10 @@ type server struct {
 	// is bound to one host), frequency was not bounded at all.
 	rate     *rateBucket
 	inflight *inflightGuard
+	// metrics is what this instance has done, counted. It lives here rather than
+	// on the client because the decisions are made here: a batch refused locally
+	// is a decision too, and the client never sees it.
+	metrics *submissionMetrics
 	// window is the per-URL half of the quota guard: a URL it remembers is
 	// dropped from the batch before the request is built, because every
 	// submitted URL spends crawl quota whether or not the engine already had it.
@@ -211,7 +216,8 @@ func newServer(cfg *Config, client *indexNowClient, log *slog.Logger) *server {
 		log:            log,
 		keyStates:      make(map[string]keyRecord, len(cfg.Sites)),
 		rate:           newRateBucket(rateBurstTokens, rateRefillInterval),
-		inflight:       newInflightGuard(maxInFlightEngineCalls),
+		inflight:       newInflightGuard(perHostInFlightLimit(len(cfg.Sites)), maxInFlightEngineCalls),
+		metrics:        newSubmissionMetrics(),
 		window:         newSubmitWindow(resubmitWindow, tracked),
 		maxURLs:        maxURLs,
 		maxBodyBytes:   maxBodyBytes,
@@ -298,34 +304,204 @@ func (b *rateBucket) take(host string) time.Duration {
 	return time.Duration(math.Ceil(missing / b.refill * float64(time.Second)))
 }
 
-// inflightGuard caps how many engine requests this instance has open at once. A
-// buffered channel is the semaphore: sending takes a slot, receiving frees one,
-// and no dependency is needed for that.
+// inflightGuard caps how many engine requests this instance has open at once,
+// at two levels: one across the whole instance, one per host.
+//
+// A single global cap is enough while there is one site. With several it is
+// unfair: eight slots shared by every host means one site with a retry loop can
+// hold all eight, and every other site is answered 503 without ever having had a
+// slot - the same starvation the per-host rate bucket exists to remove, one
+// layer down. The per-host cap bounds what one site can hold so the other sites
+// keep making progress.
+//
+// A buffered channel is each semaphore: sending takes a slot, receiving frees
+// one, and no dependency is needed for that.
 type inflightGuard struct {
-	slots chan struct{}
-	// wait is how long acquire blocks before it gives up.
+	// global is the instance-wide semaphore, maxInFlightEngineCalls slots wide.
+	global chan struct{}
+	// perHost is how many slots one host may hold at once. It comes from
+	// perHostInFlightLimit and is never wider than the instance-wide cap.
+	perHost int
+	// wait is the whole budget one request may spend taking both slots. It is
+	// one budget rather than one per cap, so a submission's worst case stays
+	// inFlightWait instead of twice that.
 	wait time.Duration
+
+	mu sync.Mutex
+	// hosts holds each host's own semaphore, created on first use. The key is
+	// always a host from the config and never a value out of a request, so the
+	// map is bounded by the config - the same rule the metric labels follow.
+	hosts map[string]chan struct{}
 }
 
-func newInflightGuard(limit int) *inflightGuard {
-	return &inflightGuard{slots: make(chan struct{}, limit), wait: inFlightWait}
+// guardDecision is what acquire decided. The refusal values are separate because
+// the caller has to be able to say which cap refused it: slowing one site down
+// and slowing the whole instance down are different instructions.
+type guardDecision int
+
+const (
+	// guardAcquired means both slots are held and have to be released.
+	guardAcquired guardDecision = iota
+	// guardRefusedSite means this site already held its own cap of slots.
+	guardRefusedSite
+	// guardRefusedInstance means the site had room but the instance did not.
+	guardRefusedInstance
+	// guardRefusedCancelled means the caller went away while waiting. Nothing
+	// was acquired, so there is nothing to release.
+	guardRefusedCancelled
+)
+
+// perHostInFlightLimit is how many engine calls one host may have open at once,
+// derived from how many sites this instance serves.
+//
+// One site means the per-host cap could only ever duplicate the global one, so
+// it is the global cap itself: a single-site deployment is exactly one host, and
+// capping it below the instance's own ceiling would throw away half the engine
+// concurrency the deployment is allowed, for a starvation problem that cannot
+// exist with one site. That is the no-regression rule: a deployment that worked
+// at eight slots keeps working at eight.
+//
+// More than one site halves it, so at least two hosts can be at their cap at the
+// same time and one noisy host can hold at most half the instance's slots while
+// the other half keeps serving everyone else. Half is the smallest split that
+// removes the starvation; a smaller share would refuse each site sooner than the
+// instance needs to.
+func perHostInFlightLimit(sites int) int {
+	if sites <= 1 {
+		return maxInFlightEngineCalls
+	}
+
+	limit := maxInFlightEngineCalls / 2
+	if limit < 1 {
+		// A cap of zero would refuse every request, so one slot is the floor
+		// even if the global cap were ever lowered to one.
+		limit = 1
+	}
+
+	return limit
 }
 
-// acquire takes a slot, waiting at most wait for one to free up. A caller that
-// gives up is told the instance is busy instead of queueing behind the engine
-// for as long as the engine takes, and it never reaches the engine.
-func (g *inflightGuard) acquire(ctx context.Context) bool {
+// newInflightGuard builds the two-level guard. A per-host cap wider than the
+// instance-wide one is clamped: it could never be reached, and keeping the
+// fields consistent makes the refusal detail honest.
+func newInflightGuard(perHost, global int) *inflightGuard {
+	if global < 1 {
+		global = 1
+	}
+	if perHost < 1 {
+		perHost = 1
+	}
+	if perHost > global {
+		perHost = global
+	}
+
+	return &inflightGuard{
+		global:  make(chan struct{}, global),
+		perHost: perHost,
+		wait:    inFlightWait,
+		hosts:   make(map[string]chan struct{}, 4),
+	}
+}
+
+// hostSlots returns one host's semaphore, creating it on first use. The key is
+// always a configured host, so this map cannot grow past the config.
+func (g *inflightGuard) hostSlots(host string) chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	slots, known := g.hosts[host]
+	if !known {
+		slots = make(chan struct{}, g.perHost)
+		g.hosts[host] = slots
+	}
+
+	return slots
+}
+
+// acquire takes one of the host's slots and then one of the instance's, waiting
+// at most g.wait in total, and reports which cap refused when it could not take
+// both. A caller that is refused holds nothing and has nothing to release.
+//
+// The order is host first, then instance, and it is what keeps this
+// deadlock-free: a goroutine that holds a global slot never waits for a host
+// slot (the submission path only ever releases), so there is no cycle to close.
+// Doing it the other way round - global, then host - would hold an instance slot
+// hostage behind whatever a single site's traffic is doing.
+//
+// It is starvation-free for the same reason plus the per-host cap: at most
+// perHost requests of one host are ever queued on the global semaphore, that
+// queue is served in arrival order, and no host can add more than its cap, so no
+// host can own the global queue. A request that cannot take both slots inside
+// the budget is refused rather than waiting forever, so nothing waits
+// indefinitely for either cap.
+func (g *inflightGuard) acquire(ctx context.Context, host string) guardDecision {
+	hostSlots := g.hostSlots(host)
+
+	deadline := time.Now().Add(g.wait)
+
+	if !takeSlot(ctx, hostSlots, deadline) {
+		if ctx.Err() != nil {
+			return guardRefusedCancelled
+		}
+
+		return guardRefusedSite
+	}
+
+	if !takeSlot(ctx, g.global, deadline) {
+		// Give the site's slot back before answering: a request that never
+		// reached the engine must not keep this host's slot, or one busy moment
+		// instance-wide would leave the site paying for it afterwards.
+		<-hostSlots
+
+		if ctx.Err() != nil {
+			return guardRefusedCancelled
+		}
+
+		return guardRefusedInstance
+	}
+
+	return guardAcquired
+}
+
+// release frees both slots acquire took, the instance's first: a sibling request
+// of the same host then finds both free in the order it needs them, instead of
+// taking the host slot and bouncing off a still-full global semaphore.
+func (g *inflightGuard) release(host string) {
+	<-g.global
+	<-g.hostSlots(host)
+}
+
+// takeSlot waits until deadline for a slot on slots.
+//
+// A slot that is free right now is taken whatever the caller's context says: the
+// submission path deliberately does not cancel a request to the engine because
+// the caller hung up (see submit), so a cancelled caller that finds a free slot
+// is still served. Only a caller that has to wait is dropped when it goes away.
+func takeSlot(ctx context.Context, slots chan struct{}, deadline time.Time) bool {
 	select {
-	case g.slots <- struct{}{}:
+	case slots <- struct{}{}:
 		return true
 	default:
 	}
 
-	timer := time.NewTimer(g.wait)
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		// Out of budget: one last look, no waiting. A slot that is free right
+		// now still counts, and waiting past the deadline is exactly what the
+		// budget forbids.
+		select {
+		case slots <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+
+	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 
 	select {
-	case g.slots <- struct{}{}:
+	case slots <- struct{}{}:
 		return true
 	case <-timer.C:
 		return false
@@ -334,12 +510,6 @@ func (g *inflightGuard) acquire(ctx context.Context) bool {
 		// hold a slot. Reported as no slot, which is what it is.
 		return false
 	}
-}
-
-// release frees the slot acquire took. Every successful acquire has exactly one
-// release, deferred by the handler.
-func (g *inflightGuard) release() {
-	<-g.slots
 }
 
 // submitWindow remembers which URLs were sent, per site host, so a caller
@@ -519,6 +689,9 @@ func (s *server) routes() http.Handler {
 	// makes citing one page a single curl, and POST for a batch.
 	mux.HandleFunc("/submit", s.handleSubmit)
 	mux.HandleFunc("GET /health", s.handleHealth)
+	// GET only, like /health: reading the counters has no side effects, and the
+	// mux answers any other method with 405 and an Allow of its own.
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	return mux
 }
 
@@ -603,6 +776,7 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	// rather than reversed, because frequency is the cheaper thing to police and
 	// the caller can see both counts in the response.
 	if wait := s.rate.take(site.Host); wait > 0 {
+		s.metrics.recordGuardRefusal(site.Host, reasonThrottled)
 		s.refuse(w, r, site.Host, submissionResult{
 			Reason:     reasonThrottled,
 			RetryAfter: wait,
@@ -611,15 +785,20 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.inflight.acquire(r.Context()) {
+	if decision := s.inflight.acquire(r.Context(), site.Host); decision != guardAcquired {
+		// Counted under the reason the caller sees, so this family and the
+		// refusal it describes always agree. A caller that hung up while queued
+		// is counted too: the guard refused it, and nobody can read the answer
+		// either way.
+		s.metrics.recordGuardRefusal(site.Host, reasonOverloaded)
 		s.refuse(w, r, site.Host, submissionResult{
 			Reason:     reasonOverloaded,
 			RetryAfter: busyRetryAfter,
-			Detail:     fmt.Sprintf("no engine slot free within %s", s.inflight.wait),
+			Detail:     s.overloadedDetail(site.Host, decision),
 		})
 		return
 	}
-	defer s.inflight.release()
+	defer s.inflight.release(site.Host)
 
 	urls, ok := s.requestURLs(w, r, site)
 	if !ok {
@@ -633,6 +812,12 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	result := s.client.submitWithWindow(*site, urls, s.window, s.maxURLs)
 	duration := time.Since(start)
+
+	// Counted whatever the outcome: this request was handled, and the reason
+	// label (or accepted) is what happened to it. The engine counters and the
+	// latency histogram stay absent unless the engine was actually asked, so a
+	// local refusal cannot look like an engine answer.
+	s.metrics.record(site.Host, result, duration, engineInvoked(result))
 
 	// Record a key verdict only when the submission produced one. A 200 proves
 	// the key works, 202 says validation is still pending, and 403 says the key
@@ -725,38 +910,39 @@ func (s *server) requestURLs(w http.ResponseWriter, r *http.Request, site *Site)
 				"reason", reasonPayloadTooLarge,
 				"remote", r.RemoteAddr,
 			)
-			writeJSON(w, http.StatusRequestEntityTooLarge, submitResponse{
-				Host:   site.Host,
-				Status: http.StatusRequestEntityTooLarge,
-				Reason: reasonPayloadTooLarge,
-				Detail: fmt.Sprintf("body exceeded the %d byte limit", s.maxBodyBytes),
-			})
+			s.refuseBody(w, site, http.StatusRequestEntityTooLarge, reasonPayloadTooLarge,
+				fmt.Sprintf("body exceeded the %d byte limit", s.maxBodyBytes))
 			return nil, false
 		}
 
 		// The body could not be read at all, so there is nothing to parse and
 		// nothing that was submitted.
-		writeJSON(w, http.StatusBadRequest, submitResponse{
-			Host:   site.Host,
-			Status: http.StatusBadRequest,
-			Reason: reasonBadRequest,
-			Detail: "body could not be read",
-		})
+		s.refuseBody(w, site, http.StatusBadRequest, reasonBadRequest, "body could not be read")
 		return nil, false
 	}
 
 	var request submitRequest
 	if err := json.Unmarshal(raw, &request); err != nil {
-		writeJSON(w, http.StatusBadRequest, submitResponse{
-			Host:   site.Host,
-			Status: http.StatusBadRequest,
-			Reason: reasonBadRequest,
-			Detail: `body must be a single {"urls": ["https://..."]} object with no trailing data`,
-		})
+		s.refuseBody(w, site, http.StatusBadRequest, reasonBadRequest,
+			`body must be a single {"urls": ["https://..."]} object with no trailing data`)
 		return nil, false
 	}
 
 	return request.URLs, true
+}
+
+// refuseBody answers a submission whose body could not be read or parsed, and
+// counts it: it is a submission this instance handled, with a reason that says
+// what was wrong and no engine call behind it.
+func (s *server) refuseBody(w http.ResponseWriter, site *Site, status int, reason, detail string) {
+	s.metrics.recordRefusal(site.Host, reason)
+
+	writeJSON(w, status, submitResponse{
+		Host:   site.Host,
+		Status: status,
+		Reason: reason,
+		Detail: detail,
+	})
 }
 
 // refuse answers a submission this instance declined to send. The engine was
@@ -785,6 +971,25 @@ func (s *server) refuse(w http.ResponseWriter, r *http.Request, host string, res
 		Detail:            result.Detail,
 		RetryAfterSeconds: seconds,
 	})
+}
+
+// overloadedDetail says which cap refused the request, because the caller's fix
+// differs: a site over its own cap has to slow that site down, while a request
+// refused by the instance-wide cap is competing with every other site and can
+// only back off and retry. The numbers are read from the guard so the answer
+// cannot drift from the cap that actually ran.
+func (s *server) overloadedDetail(host string, decision guardDecision) string {
+	switch decision {
+	case guardRefusedSite:
+		return fmt.Sprintf("this site already has %d engine calls in flight and none freed up within %s", s.inflight.perHost, s.inflight.wait)
+	case guardRefusedCancelled:
+		// Nobody is left to read this answer, but it is written honestly anyway:
+		// a client that hung up is not an overloaded instance, and a response
+		// logged by a test or a proxy must not say it was.
+		return "the client went away while waiting for an engine slot"
+	default:
+		return fmt.Sprintf("the instance already has %d engine calls in flight and none freed up within %s", cap(s.inflight.global), s.inflight.wait)
+	}
 }
 
 // retryAfterSeconds turns a wait into whole seconds for Retry-After and
@@ -824,6 +1029,25 @@ type healthErrorResponse struct {
 	OK     bool   `json:"ok"`
 	Status int    `json:"status"`
 	Reason string `json:"reason"`
+}
+
+// handleMetrics answers the counters in the Prometheus text exposition format.
+//
+// The token decides one thing and nothing else: whether the host label is
+// present. Without one every family is aggregated into a single series with no
+// host label at all - omitted rather than blanked - because /metrics is usually
+// scraped unauthenticated and a Cloudflare Tunnel makes it publicly reachable,
+// so an anonymous GET must not be able to enumerate the operator's domains. That
+// is the same rule /health follows, and it reuses the same token lookup.
+func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	perHost := s.siteForToken(bearerToken(r.Header.Get("Authorization"))) != nil
+
+	w.Header().Set("Content-Type", metricsContentType)
+	w.WriteHeader(http.StatusOK)
+
+	// The two snapshots are taken separately and never nested, so a scrape
+	// cannot hold the key-state lock while it waits for the counter lock.
+	writeMetrics(w, s.metrics.snapshot(), s.keyStatesSnapshot(), perHost)
 }
 
 // handleHealth answers whether the process is up. A stale key file is counted

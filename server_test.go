@@ -1224,13 +1224,14 @@ func TestOverloadedWhenNoEngineSlotIsFree(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
 
-	srv.inflight = newInflightGuard(1)
+	srv.inflight = newInflightGuard(1, 1)
 	// The wait is 2s in production; a test that spent 2s waiting would be slow,
 	// and the behaviour under test is what happens when the wait runs out.
 	srv.inflight.wait = 20 * time.Millisecond
 
-	// Hold the only slot, as an engine request still in flight would.
-	srv.inflight.slots <- struct{}{}
+	// Hold the instance's only slot, as an engine request still in flight would.
+	// The host's slot is free, so this exercises the instance-wide cap.
+	srv.inflight.global <- struct{}{}
 
 	recorder, decoded := postURL(t, srv, "Bearer "+testToken, "https://example.com/a")
 
@@ -1246,15 +1247,26 @@ func TestOverloadedWhenNoEngineSlotIsFree(t *testing.T) {
 	if decoded["retry_after_seconds"] == nil {
 		t.Fatalf("an overloaded response carries no retry_after_seconds: %v", decoded)
 	}
+	// The detail has to name the cap that refused, or the caller cannot tell
+	// whether to slow one site down or the whole instance.
+	detail, _ := decoded["detail"].(string)
+	if !strings.Contains(detail, "the instance") {
+		t.Fatalf("detail %q does not name the instance-wide cap", detail)
+	}
 	// No slot, so no engine call: the cap is there to keep the engine's side of
 	// the connection finite, and a request that got no slot never becomes one.
 	if got := engine.calls(); got != 0 {
 		t.Fatalf("engine was called %d times without a free slot", got)
 	}
+	// The site's own slot was taken and given back, so the refusal does not leak
+	// a host slot for as long as this instance stays busy.
+	if held := len(srv.inflight.hostSlots("example.com")); held != 0 {
+		t.Fatalf("a refused request kept %d of this site's slots", held)
+	}
 
 	// Once the slot is free the same request goes through, so a full instance
 	// is busy rather than broken.
-	srv.inflight.release()
+	<-srv.inflight.global
 
 	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
 		t.Fatalf("after the slot was freed: status = %d, want 200", recorder.Code)
