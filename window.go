@@ -118,10 +118,18 @@ func (w *submitWindow) growLimit(n int) {
 // and simply not remembered, which costs at most one resubmission.
 func (w *submitWindow) keep(host string, urls []string) (kept []string, skipped int) {
 	host = canonicalHost(host)
-	now := w.now()
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// The clock is read under the lock, and that is not incidental. Reading it
+	// before the lock made concurrent callers stamp the same URL out of order:
+	// the goroutine that sampled later could still take the lock first, so the
+	// one holding the earlier reading computed a negative age, took it for a
+	// backwards clock, forgot the entry, and let both send. Locking first makes
+	// the stamps follow lock order, and a monotonic reading cannot go backwards
+	// between two of them, so the age a reader computes is never negative.
+	now := w.now()
 
 	kept = make([]string, 0, len(urls))
 	claims := make([]windowKey, 0, len(urls))
@@ -181,6 +189,12 @@ func (w *submitWindow) insideWindow(key windowKey, now time.Time) bool {
 	// step is not evidence of a recent send, and honouring it would suppress the
 	// URL until the clock caught up, so the entry is forgotten and the URL is
 	// sent again.
+	//
+	// A real clock cannot do that here: keep and record read the clock under the
+	// same mutex that stamps the entry, and time.Now carries a monotonic reading,
+	// so a reader's now is never earlier than what it just read. This branch is
+	// for a clock that is handed in by a test, and it stays because a window that
+	// trusted a backwards stamp would suppress a URL until the clock caught up.
 	delete(w.entries, key)
 
 	return false
@@ -193,6 +207,12 @@ func (w *submitWindow) insideWindow(key windowKey, now time.Time) bool {
 // would silently eat.
 func (w *submitWindow) record(host string, urls []string) {
 	host = canonicalHost(host)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Under the lock for the reason keep gives: a stamp taken outside it can be
+	// earlier than one an earlier lock holder wrote.
 	now := w.now()
 
 	keys := make([]windowKey, 0, len(urls))
@@ -205,9 +225,6 @@ func (w *submitWindow) record(host string, urls []string) {
 	if len(keys) == 0 {
 		return
 	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	// Make room for the whole batch once rather than once per URL, so one batch
 	// pays for one sweep.
