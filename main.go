@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -37,7 +38,7 @@ func main() {
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "check":
-		err = cmdCheck(os.Args[2:])
+		err = cmdCheck(os.Args[2:], os.Stdout)
 	case "healthcheck":
 		err = cmdHealthcheck(os.Args[2:])
 	case "version", "-version", "--version":
@@ -153,7 +154,14 @@ func cmdServe(args []string) error {
 	return httpServer.Shutdown(shutdownCtx)
 }
 
-func cmdCheck(args []string) error {
+// checkSiteTimeout bounds one key-file check made by the check subcommand. It is
+// a variable rather than a constant for the same reason randReader is: a test
+// cannot otherwise reach the timeout path without spending the whole budget, so
+// the unreachable case would only ever be exercised against a refused
+// connection. Production never writes it.
+var checkSiteTimeout = 15 * time.Second
+
+func cmdCheck(args []string, out io.Writer) error {
 	configPath := configFlag("check", args)
 
 	cfg, err := loadConfig(configPath)
@@ -167,21 +175,21 @@ func cmdCheck(args []string) error {
 	unknown := 0
 
 	for _, site := range cfg.Sites {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), checkSiteTimeout)
 		err := client.verifyKey(ctx, site)
 		cancel()
 
 		switch keyStateAfterCheck(err) {
 		case keyStateVerified:
-			fmt.Printf("ok    %-32s %s\n", site.Host, site.KeyLocation)
+			fmt.Fprintf(out, "ok    %-32s %s\n", site.Host, site.KeyLocation)
 		case keyStateFailed:
 			failed++
-			fmt.Printf("FAIL  %-32s %s\n      %v\n", site.Host, site.KeyLocation, err)
+			fmt.Fprintf(out, "FAIL  %-32s %s\n      %v\n", site.Host, site.KeyLocation, err)
 		default:
 			// The file was never read, so nothing is known. Reporting this as a
 			// failure would blame a key file for an origin that is simply down.
 			unknown++
-			fmt.Printf("????  %-32s %s\n      could not determine: %v\n", site.Host, site.KeyLocation, err)
+			fmt.Fprintf(out, "????  %-32s %s\n      could not determine: %v\n", site.Host, site.KeyLocation, err)
 		}
 	}
 

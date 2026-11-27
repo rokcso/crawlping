@@ -674,6 +674,12 @@ GitHub release with the archives and `checksums.txt` attached.
 A tag containing a hyphen (`v0.2.0-rc1`) is published as a prerelease and does
 not move `latest`.
 
+The release body is generated from the commit subjects **unless**
+`docs/release-notes/<tag>.md` exists, in which case that file is used verbatim.
+Write one for any release with a breaking change: a generated body cannot say
+"`/health` no longer returns a per-host map", and somebody upgrading reads the
+release rather than the log. `docs/release-notes/v0.2.0.md` is the worked example.
+
 What the workflow deliberately does not do: no goreleaser, no cosign, no SBOM.
 At this size those are ceremony rather than protection - the build is
 `go build` and the artifact is reproducible from the tag.

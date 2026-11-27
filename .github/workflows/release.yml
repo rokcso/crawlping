@@ -206,7 +206,22 @@ jobs:
             echo "release $GITHUB_REF_NAME exists; replacing assets"
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
-            flags=(--generate-notes)
+            flags=()
             [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+
+            # --generate-notes builds the body from commit subjects, which is
+            # exactly what a breaking change does not show up in: "/health no
+            # longer returns a per-host map" is not a sentence any commit
+            # subject carries, and somebody upgrading reads the release, not the
+            # log. A hand-written file wins when one exists; the generated notes
+            # stay the default so a routine tag needs no extra file.
+            notes_file="docs/release-notes/${GITHUB_REF_NAME}.md"
+            if [ -f "$notes_file" ]; then
+              echo "using $notes_file for the release body"
+              flags+=(--notes-file "$notes_file")
+            else
+              flags+=(--generate-notes)
+            fi
+
             gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
           fi
