@@ -175,32 +175,66 @@ func (c *indexNowClient) verifyKey(ctx context.Context, site Site) error {
 	// this path made every test fixture that serves its key from 127.0.0.1 look
 	// like a broken site.
 
+	probe, err := c.probeKeyFile(ctx, site)
+	if err != nil {
+		return err
+	}
+
+	if probe.Status != http.StatusOK {
+		return fmt.Errorf("%w: key file returned %d", errKeyFileRejected, probe.Status)
+	}
+
+	if !probe.matches(site.IndexNowKey) {
+		return fmt.Errorf("%w: key file does not match indexnow_key", errKeyFileRejected)
+	}
+
+	return nil
+}
+
+// keyFileProbe is what the origin answered, before anything judges it. The
+// judgement lives in verifyKey; this exists because `doctor` has to explain the
+// answer rather than reduce it to a state, and the most useful explanation is
+// the one an error message cannot carry: a 200 that is the site's fallback page
+// rather than a key file.
+type keyFileProbe struct {
+	Status      int
+	ContentType string
+	Body        []byte
+}
+
+// matches reports whether the body is this key, allowing for the trailing
+// newline an editor or `echo` leaves. The engine trims the same way, so a file
+// that passes here is the file the engine accepts.
+func (p keyFileProbe) matches(key string) bool {
+	return strings.TrimSpace(string(p.Body)) == key
+}
+
+// probeKeyFile fetches the key file and reads at most the bytes a key occupies.
+// It is the one network path both the state machine and `doctor` use, so the two
+// cannot disagree about what the origin returned.
+func (c *indexNowClient) probeKeyFile(ctx context.Context, site Site) (keyFileProbe, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, site.KeyLocation, nil)
 	if err != nil {
-		return fmt.Errorf("%w: build key request: %w", errKeyFileUnreachable, err)
+		return keyFileProbe{}, fmt.Errorf("%w: build key request: %w", errKeyFileUnreachable, err)
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		// Includes a cancelled or timed-out check: no key file was read.
-		return fmt.Errorf("%w: fetch key file: %w", errKeyFileUnreachable, err)
+		return keyFileProbe{}, fmt.Errorf("%w: fetch key file: %w", errKeyFileUnreachable, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: key file returned %d", errKeyFileRejected, resp.StatusCode)
-	}
-
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if err != nil {
-		return fmt.Errorf("%w: read key file: %w", errKeyFileRejected, err)
+		return keyFileProbe{}, fmt.Errorf("%w: read key file: %w", errKeyFileRejected, err)
 	}
 
-	if strings.TrimSpace(string(body)) != site.IndexNowKey {
-		return fmt.Errorf("%w: key file does not match indexnow_key", errKeyFileRejected)
-	}
-
-	return nil
+	return keyFileProbe{
+		Status:      resp.StatusCode,
+		ContentType: resp.Header.Get("Content-Type"),
+		Body:        body,
+	}, nil
 }
 
 // keyStateAfterCheck maps a finished key check to the state it proves. An empty
