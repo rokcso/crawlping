@@ -1561,7 +1561,16 @@ func windowLen(w *submitWindow) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	return len(w.sent)
+	return len(w.entries)
+}
+
+// windowCap reads the window's entry cap, under its lock: it is not a constant,
+// because a reload that raises the batch size grows it.
+func windowCap(w *submitWindow) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.limit
 }
 
 func TestResubmitWindowDropsARepeatWithinTheWindow(t *testing.T) {
@@ -1745,13 +1754,16 @@ func TestResubmitWindowStaysBounded(t *testing.T) {
 		t.Fatalf("window holds %d urls after one insert past the cap, want %d", got, limit)
 	}
 
-	// page-0 was the oldest, so it is the entry that went: asking about it keeps
-	// it, while its neighbour is still inside the window.
-	if kept, skipped := window.keep("example.com", []string{"https://example.com/page-0"}); skipped != 0 || len(kept) != 1 {
-		t.Fatalf("the oldest entry survived the cap: skipped %d, kept %v", skipped, kept)
-	}
+	// page-0 was the oldest, so it is the entry that went. The neighbour is asked
+	// about first because a URL that is not remembered is claimed as it is looked
+	// up, and a claim is a write: it needs room like any other entry, so it may
+	// evict the oldest one. Asking about the suppressed neighbour first keeps both
+	// assertions about what the cap actually kept, in the order they hold.
 	if _, skipped := window.keep("example.com", []string{"https://example.com/page-1"}); skipped != 1 {
 		t.Fatalf("a recent entry was evicted: skipped %d, want 1", skipped)
+	}
+	if kept, skipped := window.keep("example.com", []string{"https://example.com/page-0"}); skipped != 0 || len(kept) != 1 {
+		t.Fatalf("the oldest entry survived the cap: skipped %d, kept %v", skipped, kept)
 	}
 
 	// A batch larger than the whole window cannot be remembered in full. The cap
@@ -1767,9 +1779,6 @@ func TestResubmitWindowStaysBounded(t *testing.T) {
 }
 
 func TestResubmitWindowIsSafeUnderConcurrency(t *testing.T) {
-	// The window is shared by every request, so the race detector is the point of
-	// this test: many goroutines keep and record at once, on a window small enough
-	// that all of them also evict.
 	window := newSubmitWindow(resubmitWindow, 8)
 
 	var wg sync.WaitGroup
@@ -1799,6 +1808,98 @@ func TestResubmitWindowIsSafeUnderConcurrency(t *testing.T) {
 
 	if got := windowLen(window); got > 8 {
 		t.Fatalf("window holds %d urls, want at most 8", got)
+	}
+}
+
+func TestResubmitWindowClaimsAURLUntilItIsReleasedOrRecorded(t *testing.T) {
+	// The window is the check, and the engine call is the act. Claiming the URL
+	// under the window's own lock is what stops two concurrent requests from both
+	// passing the check and both spending quota on one URL.
+	window := newSubmitWindow(resubmitWindow, 8)
+	clock := newFrozenClock()
+	window.now = clock.Now
+
+	urls := []string{"https://example.com/a"}
+
+	if kept, skipped := window.keep("example.com", urls); skipped != 0 || len(kept) != 1 {
+		t.Fatalf("first keep: kept %v, skipped %d, want the url kept", kept, skipped)
+	}
+
+	// A second look while the first batch is in flight sees the claim, and skips
+	// the URL: this is the half that used to be missing.
+	if kept, skipped := window.keep("example.com", urls); skipped != 1 || len(kept) != 0 {
+		t.Fatalf("second keep: kept %v, skipped %d, want the claim to suppress it", kept, skipped)
+	}
+
+	// A batch that did not land gives its claim back, so the caller's retry is
+	// sent instead of being suppressed for a whole window.
+	window.release("example.com", urls)
+	if kept, skipped := window.keep("example.com", urls); skipped != 0 || len(kept) != 1 {
+		t.Fatalf("after release: kept %v, skipped %d, want the url kept again", kept, skipped)
+	}
+
+	// A recorded send is evidence that the engine took the URL, so a release can
+	// never un-send it.
+	window.record("example.com", urls)
+	window.release("example.com", urls)
+	if kept, skipped := window.keep("example.com", urls); skipped != 1 || len(kept) != 0 {
+		t.Fatalf("after record: kept %v, skipped %d, want the send remembered", kept, skipped)
+	}
+
+	// And a claim nobody released or promoted is self-healing: it ages out with
+	// the window like a send would, so a leak cannot suppress a URL forever.
+	leaked := []string{"https://example.com/leaked"}
+	if _, skipped := window.keep("example.com", leaked); skipped != 0 {
+		t.Fatalf("claiming a new url was skipped: %d", skipped)
+	}
+	clock.advance(resubmitWindow)
+	if kept, skipped := window.keep("example.com", leaked); skipped != 0 || len(kept) != 1 {
+		t.Fatalf("a claim outlived the window: kept %v, skipped %d", kept, skipped)
+	}
+}
+
+func TestConcurrentSubmissionsOfOneURLCallTheEngineOnce(t *testing.T) {
+	// Two requests carrying the same URL, released at the same moment. The claim
+	// is taken under the window's mutex before either reaches the engine, so the
+	// second one - whichever it is - must find the URL inside the window. No sleep
+	// orders them: both orders end in one send and one skip, which is why this is
+	// not a timing test.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+	rt := testRuntime(srv)
+
+	const submitters = 2
+
+	urls := []string{"https://example.com/one"}
+	start := make(chan struct{})
+	results := make(chan submissionResult, submitters)
+
+	for i := 0; i < submitters; i++ {
+		go func() {
+			<-start
+			results <- rt.client.submitWithWindow(rt.sites[0], urls, srv.window, rt.maxURLs)
+		}()
+	}
+
+	close(start)
+
+	var sent, skipped int
+	for i := 0; i < submitters; i++ {
+		switch result := <-results; {
+		case result.Submitted == 1 && result.Skipped == 0:
+			sent++
+		case result.Submitted == 0 && result.Skipped == 1:
+			skipped++
+		default:
+			t.Fatalf("unexpected result: %+v, want one send and one skip", result)
+		}
+	}
+
+	if sent != 1 || skipped != 1 {
+		t.Fatalf("sent %d and skipped %d of %d requests, want 1 and 1", sent, skipped, submitters)
+	}
+	if got := engine.calls(); got != 1 {
+		t.Fatalf("engine calls = %d, want 1 for one url submitted twice at once", got)
 	}
 }
 

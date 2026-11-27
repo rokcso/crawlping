@@ -171,8 +171,11 @@ type server struct {
 
 	mu sync.RWMutex
 	// keyStates holds the last recorded state per host. A host that is absent
-	// is pending, which is the honest default and the reason the map only ever
-	// grows: setKeyState is the only writer.
+	// is pending, which is the honest default. setKeyState is the only writer of
+	// a verdict; applyConfigBytes is the only remover, and it drops exactly the
+	// hosts the config no longer carries, because a fact about a host this
+	// instance stopped serving is not worth keeping and would be inherited by
+	// that host if it were added back.
 	keyStates map[string]keyRecord
 
 	// rate and inflight bound what this instance spends its own egress IP on.
@@ -248,9 +251,10 @@ func newServerWithSource(cfg *Config, client *indexNowClient, log *slog.Logger, 
 	// The window has to be able to remember one full batch, or a raised
 	// max_urls_per_request would send URLs it then silently forgets, and every
 	// one of them would be resubmitted immediately. Its own cap still applies on
-	// top, as the bound on arbitrary input. It is sized from the config this
-	// instance starts with and keeps that size across reloads: it is a memory
-	// bound on remembered URLs, not a property of the current batch limit.
+	// top, as the bound on arbitrary input. This is the size the process starts
+	// with; applyConfigBytes grows it to match a reload that raised the count, so
+	// the property holds for every config this instance ever serves, not only
+	// the one it booted on.
 	tracked := maxTrackedURLs
 	if maxURLs := newRuntime(cfg, client).maxURLs; maxURLs > tracked {
 		tracked = maxURLs
@@ -316,6 +320,56 @@ func (s *server) applyConfigBytes(ctx context.Context, cfg *Config, raw []byte) 
 	next := newRuntime(cfg, newIndexNowClient(cfg.IndexNowEndpoint))
 	next.source = raw
 	prev := s.rt.Swap(next)
+
+	// The window's cap has to keep up with max_urls_per_request, or a reload that
+	// raised the count would leave a table too small to remember one full batch:
+	// the batch goes out, the table cannot hold it, and every URL in it is
+	// forgotten and sent again on the next attempt. Growing is the only direction
+	// needed - the cap is a memory bound, and a shrunk one would evict entries a
+	// caller was already promised - which is why there is no setLimit beside it.
+	want := maxTrackedURLs
+	if next.maxURLs > want {
+		want = next.maxURLs
+	}
+	s.window.growLimit(want)
+
+	// The per-site share is the width of a semaphore channel that may already have
+	// slots held, and a channel cannot be resized without losing them, so this is
+	// decided once when the process starts and a reload deliberately keeps it.
+	// That matters when the site count crosses the one-site threshold, because the
+	// two answers differ: a deployment that started with one site keeps all 8 slots
+	// per host after a second site is added, while the documented split for two
+	// sites is 4. Keeping it silently would leave an operator believing the split
+	// is in force, so the reload says which number runs and which one a restart
+	// would apply.
+	if prev != nil {
+		if running, afterRestart := perHostInFlightLimit(len(prev.sites)), perHostInFlightLimit(len(next.sites)); running != afterRestart {
+			s.log.Warn("per-site engine share is decided at startup; this reload kept the running one",
+				"running", s.inflight.perHost,
+				"after_restart", afterRestart,
+				"sites", len(next.sites),
+			)
+		}
+	}
+
+	// A key verdict is a fact about a host this instance serves. Once a host leaves
+	// the config, the record says nothing about anything this instance can submit
+	// for, and keeping it is what made a re-added host inherit an old "verified"
+	// with an old checked_at without being re-checked: only hosts that are new
+	// relative to the previous config are checked, so a returning host would have
+	// no evidence of its own and would fall back on last time's. Dropping the
+	// record is what makes it come back pending and get its key file checked.
+	s.mu.Lock()
+	served := make(map[string]bool, len(next.sites))
+	for _, site := range next.sites {
+		served[site.Host] = true
+	}
+	for host := range s.keyStates {
+		if !served[host] {
+			delete(s.keyStates, host)
+		}
+	}
+	s.mu.Unlock()
 
 	// Only hosts the previous config did not already carry are checked. The
 	// other states are evidence about files that have not changed, and a reload
@@ -486,6 +540,12 @@ const (
 // the other half keeps serving everyone else. Half is the smallest split that
 // removes the starvation; a smaller share would refuse each site sooner than the
 // instance needs to.
+//
+// This is answered once, when the process starts. The share is the width of a
+// semaphore channel, and a channel that already has slots held cannot be resized
+// without losing them, so a reload keeps the share it booted with and only warns
+// when the site count has crossed the threshold (see applyConfigBytes). A restart
+// is what applies the share the current site count implies.
 func perHostInFlightLimit(sites int) int {
 	if sites <= 1 {
 		return maxInFlightEngineCalls
@@ -647,6 +707,14 @@ func takeSlot(ctx context.Context, slots chan struct{}, deadline time.Time) bool
 // The mutex covers the map arithmetic only, never an engine call, and the clock
 // is a field so a test can advance time instead of sleeping - the same shape as
 // rateBucket, for the same reasons.
+//
+// A URL enters the map as a claim before the batch that carries it is sent, and
+// only a batch the engine accepted promotes that claim to a recorded send. The
+// claim is what closes the check-then-act race the two calls used to leave open:
+// two concurrent requests for the same URL both read "not in the window" before
+// either had written anything, and both spent quota on it. A claim is bounded in
+// time like everything else here, so one that is never released or promoted ages
+// out with the window and cannot suppress a URL forever.
 type submitWindow struct {
 	window time.Duration
 	limit  int
@@ -655,8 +723,17 @@ type submitWindow struct {
 	// an entry.
 	now func() time.Time
 
-	mu   sync.Mutex
-	sent map[windowKey]time.Time
+	mu      sync.Mutex
+	entries map[windowKey]windowEntry
+}
+
+// windowEntry is one remembered URL. claimed means a batch carrying it is in
+// flight right now: the URL is inside the window, so a concurrent request skips
+// it, but nothing has been sent yet - so a batch that fails can drop the claim
+// and leave the caller's retry unsuppressed.
+type windowEntry struct {
+	at      time.Time
+	claimed bool
 }
 
 // windowKey is one URL on one site. The host is part of the key rather than
@@ -669,16 +746,37 @@ type windowKey struct {
 
 func newSubmitWindow(window time.Duration, limit int) *submitWindow {
 	return &submitWindow{
-		window: window,
-		limit:  limit,
-		now:    time.Now,
-		sent:   make(map[windowKey]time.Time, 4),
+		window:  window,
+		limit:   limit,
+		now:     time.Now,
+		entries: make(map[windowKey]windowEntry, 4),
 	}
 }
 
-// keep drops the URLs sent less than the window ago and reports how many it
-// dropped. The kept slice is what the request is built from, so the count and
-// what reaches the engine cannot disagree.
+// growLimit raises the map's cap to n, and never lowers it. Growing is safe
+// because only the cap changes: no entry is evicted to make room, so every URL
+// this window already remembered keeps its place. Lowering it is refused on
+// purpose - the limit is a memory bound, not a property of the current config,
+// and a smaller cap would evict URLs a caller was promised were remembered, at
+// the price of resubmitting pages nobody changed.
+func (w *submitWindow) growLimit(n int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if n > w.limit {
+		w.limit = n
+	}
+}
+
+// keep drops the URLs the window already carries and claims the rest, so a
+// concurrent request carrying the same URL sees it inside the window and skips
+// it. The claim is made under the same lock as the lookup, which is what makes
+// exactly one of two racing requests the one that reaches the engine.
+//
+// The kept slice is what the request is built from, so the count and what
+// reaches the engine cannot disagree. Every kept URL is also claimed unless it is
+// past maxTrackedURLLength, which is not worth remembering - such a URL is sent
+// and simply not remembered, which costs at most one resubmission.
 func (w *submitWindow) keep(host string, urls []string) (kept []string, skipped int) {
 	host = canonicalHost(host)
 	now := w.now()
@@ -687,27 +785,55 @@ func (w *submitWindow) keep(host string, urls []string) (kept []string, skipped 
 	defer w.mu.Unlock()
 
 	kept = make([]string, 0, len(urls))
+	claims := make([]windowKey, 0, len(urls))
+
 	for _, url := range urls {
 		if w.insideWindow(windowKey{host: host, url: url}, now) {
 			skipped++
 			continue
 		}
+
 		kept = append(kept, url)
+
+		if len(url) <= maxTrackedURLLength {
+			claims = append(claims, windowKey{host: host, url: url})
+		}
+	}
+
+	if len(claims) > 0 {
+		w.makeRoom(now, len(claims))
+
+		for _, key := range claims {
+			w.entries[key] = windowEntry{at: now, claimed: true}
+		}
+
+		// The same cap record honours: a batch larger than the whole map cannot
+		// be remembered in full, and here the cap wins.
+		for len(w.entries) > w.limit {
+			w.evictOldest()
+		}
 	}
 
 	return kept, skipped
 }
 
-// insideWindow reports whether key was sent less than the window ago, and
-// forgets it when it was not: an entry the window has released can answer
-// nothing, so it must not keep occupying a bounded map.
+// insideWindow reports whether key is inside the window - sent less than the
+// window ago, or claimed by a batch that is in flight right now - and forgets it
+// when it was not: an entry the window has released can answer nothing, so it
+// must not keep occupying a bounded map.
+//
+// A claim is treated exactly like a recorded send while its batch is out, which
+// is the whole point of making it; and because it is stamped when the batch is
+// built, a claim that is never released or promoted is forgotten after one
+// window like any other entry. A leaked claim is therefore self-healing and
+// cannot suppress a URL for longer than a send would have.
 func (w *submitWindow) insideWindow(key windowKey, now time.Time) bool {
-	sentAt, known := w.sent[key]
+	entry, known := w.entries[key]
 	if !known {
 		return false
 	}
 
-	age := now.Sub(sentAt)
+	age := now.Sub(entry.at)
 	if age >= 0 && age < w.window {
 		return true
 	}
@@ -716,15 +842,16 @@ func (w *submitWindow) insideWindow(key windowKey, now time.Time) bool {
 	// step is not evidence of a recent send, and honouring it would suppress the
 	// URL until the clock caught up, so the entry is forgotten and the URL is
 	// sent again.
-	delete(w.sent, key)
+	delete(w.entries, key)
 
 	return false
 }
 
-// record remembers that these URLs were sent just now. Only a request that was
-// actually built and accepted is recorded: a URL that was suppressed must never
-// extend its own window, and a submission that failed leaves the caller a retry
-// to make, which suppressing would silently eat.
+// record remembers that these URLs were sent just now, promoting the claim keep
+// made for each of them. Only a request that was actually built and accepted is
+// recorded: a URL that was suppressed must never extend its own window, and a
+// submission that failed leaves the caller a retry to make, which suppressing
+// would silently eat.
 func (w *submitWindow) record(host string, urls []string) {
 	host = canonicalHost(host)
 	now := w.now()
@@ -748,33 +875,51 @@ func (w *submitWindow) record(host string, urls []string) {
 	w.makeRoom(now, len(keys))
 
 	for _, key := range keys {
-		w.sent[key] = now
+		w.entries[key] = windowEntry{at: now}
 	}
 
 	// A single batch larger than the whole map cannot be remembered in full, and
 	// here the cap wins: it is what keeps arbitrary input from growing this
 	// structure. maxURLsPerRequest is far below maxTrackedURLs, so this only runs
 	// for a deliberately tiny window.
-	for len(w.sent) > w.limit {
+	for len(w.entries) > w.limit {
 		w.evictOldest()
+	}
+}
+
+// release drops the claims keep made for a batch that was never accepted, so a
+// failure leaves the caller's retry unsuppressed. Only a claim is dropped: a
+// recorded entry is evidence the engine took those URLs, and a release must
+// never be able to un-send one.
+func (w *submitWindow) release(host string, urls []string) {
+	host = canonicalHost(host)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, url := range urls {
+		key := windowKey{host: host, url: url}
+		if entry, known := w.entries[key]; known && entry.claimed {
+			delete(w.entries, key)
+		}
 	}
 }
 
 // makeRoom forgets entries until the map can hold need more.
 func (w *submitWindow) makeRoom(now time.Time, need int) {
-	if len(w.sent)+need <= w.limit {
+	if len(w.entries)+need <= w.limit {
 		return
 	}
 
 	// Entries the window has already released answer nothing, so they go first:
 	// in a normal deployment they are the only ones that ever need to.
-	for key, sentAt := range w.sent {
-		if age := now.Sub(sentAt); age < 0 || age >= w.window {
-			delete(w.sent, key)
+	for key, entry := range w.entries {
+		if age := now.Sub(entry.at); age < 0 || age >= w.window {
+			delete(w.entries, key)
 		}
 	}
 
-	for len(w.sent)+need > w.limit && len(w.sent) > 0 {
+	for len(w.entries)+need > w.limit && len(w.entries) > 0 {
 		w.evictOldest()
 	}
 }
@@ -788,14 +933,14 @@ func (w *submitWindow) evictOldest() {
 		found    bool
 	)
 
-	for key, sentAt := range w.sent {
-		if !found || sentAt.Before(oldestAt) {
-			oldest, oldestAt, found = key, sentAt, true
+	for key, entry := range w.entries {
+		if !found || entry.at.Before(oldestAt) {
+			oldest, oldestAt, found = key, entry.at, true
 		}
 	}
 
 	if found {
-		delete(w.sent, oldest)
+		delete(w.entries, oldest)
 	}
 }
 

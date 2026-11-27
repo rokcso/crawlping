@@ -304,14 +304,33 @@ func (c *indexNowClient) submitWithWindow(site Site, urls []string, window *subm
 	}
 
 	skipped := 0
+	// committed is set only once the engine has accepted the batch and the URLs
+	// are recorded. Until then the window holds a claim on each of them, and every
+	// way out of this function that is not an accepted batch has to give the claim
+	// back: a claim left behind would suppress the caller's retry for a whole
+	// window, which is the same lie as recording a submission that failed. One
+	// deferred release covers all of those paths - a failed marshal, a request
+	// that could not be built, a send that never landed, and every refusal status -
+	// so a new early return cannot forget it.
+	committed := false
+
 	if window != nil {
 		clean, skipped = window.keep(site.Host, clean)
+
+		defer func() {
+			if !committed {
+				window.release(site.Host, clean)
+			}
+		}()
+
 		if len(clean) == 0 {
 			// Everything in the batch was sent inside the window. That is not a
 			// failure and not a refusal: the caller asked for something that is
 			// already true. Nothing is built and no engine is called, so the
 			// result carries no status, no reason and nothing recorded - recording
-			// here would let a suppressed URL extend its own window forever.
+			// here would let a suppressed URL extend its own window forever. The
+			// release above finds no claim of its own to drop: every URL here was
+			// already inside the window when it was looked up.
 			return submissionResult{Skipped: skipped}
 		}
 	}
@@ -380,9 +399,10 @@ func (c *indexNowClient) submitWithWindow(site Site, urls []string, window *subm
 	// Only an accepted batch (200 or 202) proves the URLs were taken, so only
 	// then are they remembered. A refusal, a rate limit or an engine error leaves
 	// the caller something to do, and the caller's retry is what the next
-	// submission is for.
+	// submission is for - which is why committed is set here and nowhere else.
 	if window != nil {
 		window.record(site.Host, clean)
+		committed = true
 	}
 
 	return result

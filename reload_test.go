@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,8 +30,17 @@ func reloadTestConfig(t *testing.T, body string) string {
 	return path
 }
 
-func reloadTwoSiteConfig(secondHost, secondToken string) string {
+// reloadTwoSiteConfig is a config with two sites, written for a reload. endpoint
+// is the indexnow_endpoint the reloaded runtime will submit to, and it is a
+// parameter rather than left out because a reload builds a fresh client from the
+// config it reads: a fixture without one gets the default endpoint and every
+// submission after the reload goes to the public engine instead of this test's
+// own httptest server, which is both a network call and an assertion that
+// depends on api.indexnow.org.
+func reloadTwoSiteConfig(endpoint, secondHost, secondToken string) string {
 	return fmt.Sprintf(`listen: "127.0.0.1:0"
+
+indexnow_endpoint: %q
 
 sites:
   - host: example.com
@@ -39,13 +49,47 @@ sites:
   - host: %s
     indexnow_key: %s
     token: %s
-`, testFixtureKey(), testToken, secondHost, "k"+strings.Repeat("8", 15), secondToken)
+`, endpoint, testFixtureKey(), testToken, secondHost, "k"+strings.Repeat("8", 15), secondToken)
+}
+
+// reloadOneSiteConfig is the one-site config a reload test removes a host from.
+// It carries its own indexnow_endpoint for the same reason reloadTwoSiteConfig
+// takes one: a reloaded runtime that is pointed at nothing in particular reaches
+// the public engine.
+func reloadOneSiteConfig(endpoint string) string {
+	return fmt.Sprintf(`listen: "127.0.0.1:0"
+
+indexnow_endpoint: %q
+
+sites:
+  - host: example.com
+    indexnow_key: %s
+    token: %s
+`, endpoint, testFixtureKey(), testToken)
+}
+
+// reloadLimitsConfig is a one-site config with an explicit limits block, so a
+// reload can change the submission size and nothing else.
+func reloadLimitsConfig(endpoint string, maxURLs, maxBodyBytes int) string {
+	return fmt.Sprintf(`listen: "127.0.0.1:0"
+
+indexnow_endpoint: %q
+
+limits:
+  max_urls_per_request: %d
+  max_body_bytes: %d
+
+sites:
+  - host: example.com
+    indexnow_key: %s
+    token: %s
+`, endpoint, maxURLs, maxBodyBytes, testFixtureKey(), testToken)
 }
 
 func TestReloadAddsASiteWithoutRestarting(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	path := reloadTestConfig(t, reloadTwoSiteConfig("shop.example.org", "second-token-0123456789"))
+	path := reloadTestConfig(t, reloadTwoSiteConfig(engine.server.URL, "shop.example.org", "second-token-0123456789"))
 
 	// Before the reload the new host is unknown, which is the state a caller
 	// sees until the signal arrives.
@@ -82,7 +126,7 @@ func TestReloadKeepsTheMetricsItAlreadyCounted(t *testing.T) {
 		t.Fatalf("accepted counter before reload = %v, want 1", before)
 	}
 
-	path := reloadTestConfig(t, reloadTwoSiteConfig("shop.example.org", "second-token-0123456789"))
+	path := reloadTestConfig(t, reloadTwoSiteConfig(engine.server.URL, "shop.example.org", "second-token-0123456789"))
 	if err := srv.reload(context.Background(), path); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -107,7 +151,7 @@ func TestReloadKeepsTheThrottleItAlreadySpent(t *testing.T) {
 		}
 	}
 
-	path := reloadTestConfig(t, oneSiteConfigBody())
+	path := reloadTestConfig(t, reloadOneSiteConfig(engine.server.URL))
 	if err := srv.reload(context.Background(), path); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -116,12 +160,6 @@ func TestReloadKeepsTheThrottleItAlreadySpent(t *testing.T) {
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("after a reload that spent nothing, status = %d, want 429 (%v)", recorder.Code, body)
 	}
-}
-
-// oneSiteConfigBody is the config the reload tests start from, written through
-// the same helper the site tests use so the two cannot drift.
-func oneSiteConfigBody() string {
-	return testConfigYAML(testFixtureKey(), testToken, "")
 }
 
 func TestReloadRejectsAConfigThatDoesNotLoadAndKeepsServing(t *testing.T) {
@@ -148,7 +186,7 @@ func TestReloadDropsAHostThatWasRemoved(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
 
-	added := reloadTestConfig(t, reloadTwoSiteConfig("shop.example.org", "second-token-0123456789"))
+	added := reloadTestConfig(t, reloadTwoSiteConfig(engine.server.URL, "shop.example.org", "second-token-0123456789"))
 	if err := srv.reload(context.Background(), added); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -157,7 +195,7 @@ func TestReloadDropsAHostThatWasRemoved(t *testing.T) {
 	}
 
 	removed := filepath.Join(t.TempDir(), initConfigName)
-	if err := os.WriteFile(removed, []byte(oneSiteConfigBody()), initConfigMode); err != nil {
+	if err := os.WriteFile(removed, []byte(reloadOneSiteConfig(engine.server.URL)), initConfigMode); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	if err := srv.reload(context.Background(), removed); err != nil {
@@ -180,7 +218,7 @@ func TestReloadReusesOneClientForTheWholeRuntime(t *testing.T) {
 	// belongs to a different config.
 	engine := newFakeEngine(t, http.StatusOK)
 	srv := newTestServer(t, engine)
-	path := reloadTestConfig(t, reloadTwoSiteConfig("shop.example.org", "second-token-0123456789"))
+	path := reloadTestConfig(t, reloadTwoSiteConfig(engine.server.URL, "shop.example.org", "second-token-0123456789"))
 
 	if err := srv.reload(context.Background(), path); err != nil {
 		t.Fatalf("reload: %v", err)
@@ -208,7 +246,7 @@ func TestReloadLogsWhatChanged(t *testing.T) {
 		}},
 	}, newIndexNowClient(engine.server.URL), slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	path := reloadTestConfig(t, reloadTwoSiteConfig("shop.example.org", "second-token-0123456789"))
+	path := reloadTestConfig(t, reloadTwoSiteConfig(engine.server.URL, "shop.example.org", "second-token-0123456789"))
 	if err := srv.reload(context.Background(), path); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -258,7 +296,8 @@ func TestReloadChecksOnlyTheNewHostsKeyFile(t *testing.T) {
 	// either, that engine verdict would be replaced by a weaker one.
 	secondKey := "k" + strings.Repeat("8", 15)
 	next := &Config{
-		Listen: "127.0.0.1:0",
+		Listen:           "127.0.0.1:0",
+		IndexNowEndpoint: engine.server.URL,
 		Sites: []Site{
 			{
 				Host:        "example.com",
@@ -316,7 +355,7 @@ func TestReloadWarnsWhenTheFileDidNotChange(t *testing.T) {
 		}},
 	}, newIndexNowClient(engine.server.URL), slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	path := reloadTestConfig(t, oneSiteConfigBody())
+	path := reloadTestConfig(t, reloadOneSiteConfig(engine.server.URL))
 	if err := srv.reload(context.Background(), path); err != nil {
 		t.Fatalf("first reload: %v", err)
 	}
@@ -348,13 +387,13 @@ func TestReloadDoesNotWarnWhenTheFileReallyChanged(t *testing.T) {
 		}},
 	}, newIndexNowClient(engine.server.URL), slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	path := reloadTestConfig(t, oneSiteConfigBody())
+	path := reloadTestConfig(t, reloadOneSiteConfig(engine.server.URL))
 	if err := srv.reload(context.Background(), path); err != nil {
 		t.Fatalf("first reload: %v", err)
 	}
 
 	logs.Reset()
-	if err := os.WriteFile(path, []byte(reloadTwoSiteConfig("shop.example.org", "second-token-0123456789")), initConfigMode); err != nil {
+	if err := os.WriteFile(path, []byte(reloadTwoSiteConfig(engine.server.URL, "shop.example.org", "second-token-0123456789")), initConfigMode); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	if err := srv.reload(context.Background(), path); err != nil {
@@ -374,7 +413,7 @@ func TestServerRemembersTheBytesItStartedFrom(t *testing.T) {
 	// it was started with can only notice a stale file after one successful
 	// reload, which is exactly one reload too late.
 	engine := newFakeEngine(t, http.StatusOK)
-	raw := []byte(oneSiteConfigBody())
+	raw := []byte(reloadOneSiteConfig(engine.server.URL))
 
 	cfg, err := parseConfig(raw)
 	if err != nil {
@@ -393,5 +432,213 @@ func TestServerRemembersTheBytesItStartedFrom(t *testing.T) {
 	plain := newServer(cfg, newIndexNowClient(engine.server.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if got := testRuntime(plain).source; got != nil {
 		t.Fatalf("a hand-built server claims a source of %q", got)
+	}
+}
+
+func TestReloadGrowsTheResubmissionWindowToAFullBatch(t *testing.T) {
+	// The window has to remember one full batch, or a raised
+	// max_urls_per_request sends URLs it then forgets and every one of them is
+	// resubmitted immediately. That has to hold for the config a reload installs,
+	// not only for the one the process started on.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	if got := windowCap(srv.window); got != maxTrackedURLs {
+		t.Fatalf("window cap at startup = %d, want %d", got, maxTrackedURLs)
+	}
+
+	// 2000 fits under the default cap, so the window already remembers a full
+	// batch of this size and the number does not have to move for the property to
+	// hold. What matters here is that the reload does not leave a window smaller
+	// than the batch it now accepts.
+	if err := srv.reload(context.Background(), reloadTestConfig(t, reloadLimitsConfig(engine.server.URL, 2000, 512000))); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := windowCap(srv.window); got < 2000 {
+		t.Fatalf("window cap after a 2000-url limit = %d, which cannot remember one full batch", got)
+	}
+
+	// Past the default cap, growth is what makes the difference: 5000 URLs do not
+	// fit in 4096 entries.
+	if err := srv.reload(context.Background(), reloadTestConfig(t, reloadLimitsConfig(engine.server.URL, 5000, 128000))); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := windowCap(srv.window); got != 5000 {
+		t.Fatalf("window cap after a 5000-url limit = %d, want 5000", got)
+	}
+
+	// And a reload that lowers the count does not shrink it again: the cap is a
+	// memory bound, and evicting entries a caller was already promised would
+	// resubmit URLs nobody changed.
+	if err := srv.reload(context.Background(), reloadTestConfig(t, reloadLimitsConfig(engine.server.URL, 2000, 512000))); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := windowCap(srv.window); got != 5000 {
+		t.Fatalf("window cap after the count went back down = %d, want it kept at 5000", got)
+	}
+}
+
+func TestReloadKeepsThePerSiteShareItStartedWith(t *testing.T) {
+	// The per-site share is the width of a semaphore channel that may already have
+	// slots held, so a reload cannot resize it. A single-site deployment that adds
+	// a second site therefore keeps all 8 slots per host, where a restart would
+	// give 4 - and it keeps serving, which is what SIGHUP is for.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	if got := srv.inflight.perHost; got != maxInFlightEngineCalls {
+		t.Fatalf("per-host cap before the reload = %d, want %d", got, maxInFlightEngineCalls)
+	}
+
+	path := reloadTestConfig(t, reloadTwoSiteConfig(engine.server.URL, otherHost, otherToken))
+	if err := srv.reload(context.Background(), path); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	if got := getHealth(t, srv).Sites; got != 2 {
+		t.Fatalf("sites after the reload = %d, want 2", got)
+	}
+	if got := srv.inflight.perHost; got != maxInFlightEngineCalls {
+		t.Fatalf("per-host cap after the reload = %d, want the startup value %d kept", got, maxInFlightEngineCalls)
+	}
+	if got := cap(srv.inflight.hostSlots(otherHost)); got != maxInFlightEngineCalls {
+		t.Fatalf("the added host's semaphore is %d wide, want %d", got, maxInFlightEngineCalls)
+	}
+
+	// And the added host is served, through this test's own engine: the fixture
+	// carries the endpoint a reloaded runtime builds its client from.
+	recorder, body := postURL(t, srv, "Bearer "+otherToken, "https://"+otherHost+"/a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("the added host: status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+	if body["host"] != otherHost {
+		t.Fatalf("the added host: host = %v, want %q", body["host"], otherHost)
+	}
+	if got := engine.calls(); got != 1 {
+		t.Fatalf("engine calls = %d, want 1", got)
+	}
+}
+
+func TestReloadWarnsWhenThePerSiteShareWouldChange(t *testing.T) {
+	// The other direction, and the one a log line can be checked on without a
+	// background key check racing the assertion: a two-site deployment that drops
+	// to one site keeps 4 slots per host while a restart would give 8. The running
+	// number is kept, and the line has to say both numbers, because otherwise an
+	// operator reads the documented split and believes it is in force.
+	engine := newFakeEngine(t, http.StatusOK)
+	var logs strings.Builder
+	srv := newServer(&Config{
+		Listen:           "127.0.0.1:0",
+		IndexNowEndpoint: engine.server.URL,
+		Sites:            reloadTwoSites(),
+	}, newIndexNowClient(engine.server.URL), slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	path := reloadTestConfig(t, reloadOneSiteConfig(engine.server.URL))
+	if err := srv.reload(context.Background(), path); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	if got := srv.inflight.perHost; got != maxInFlightEngineCalls/2 {
+		t.Fatalf("per-host cap after dropping a site = %d, want the startup %d kept", got, maxInFlightEngineCalls/2)
+	}
+
+	line := logs.String()
+	if !strings.Contains(line, "per-site engine share") {
+		t.Fatalf("the reload said nothing about the share it kept:\n%s", line)
+	}
+	if !strings.Contains(line, "WARN") {
+		t.Fatalf("the kept share is not a warning:\n%s", line)
+	}
+	for _, want := range []string{`"running":4`, `"after_restart":8`} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("the line does not carry %s:\n%s", want, line)
+		}
+	}
+}
+
+// reloadTwoSites is the site list reloadTwoSiteConfig writes, as values, for a
+// test that starts a server from it rather than reloading into it.
+func reloadTwoSites() []Site {
+	return []Site{
+		{
+			Host:        "example.com",
+			IndexNowKey: testFixtureKey(),
+			KeyLocation: "https://example.com/" + testFixtureKey() + ".txt",
+			Token:       testToken,
+		},
+		{
+			Host:        otherHost,
+			IndexNowKey: "k" + strings.Repeat("8", 15),
+			KeyLocation: "https://" + otherHost + "/k" + strings.Repeat("8", 15) + ".txt",
+			Token:       otherToken,
+		},
+	}
+}
+
+func TestReloadForgetsARemovedHostsKeyState(t *testing.T) {
+	// A key verdict is a fact about a host this instance serves. Keeping it after
+	// the host is removed is what let a re-added host inherit an old "verified"
+	// with an old checked_at: only hosts the previous config did not carry are
+	// checked, so a returning host has no evidence of its own and would fall back
+	// on last time's.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTwoSiteServer(t, engine)
+
+	srv.setKeyState(otherHost, keyStateVerified, "")
+	if got := keyStateFor(srv, otherHost); got != keyStateVerified {
+		t.Fatalf("seed state = %q, want %q", got, keyStateVerified)
+	}
+
+	path := reloadTestConfig(t, reloadOneSiteConfig(engine.server.URL))
+	if err := srv.reload(context.Background(), path); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	srv.mu.RLock()
+	_, known := srv.keyStates[otherHost]
+	srv.mu.RUnlock()
+
+	if known {
+		t.Fatalf("the removed host kept its key state")
+	}
+
+	// Re-adding the host must not bring the verdict back. The site's key file is
+	// served by a local origin that answers 404, so the check that a returning
+	// host now gets can only end in pending or failed, never in a stale verified.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	defer origin.Close()
+
+	const secondKey = "k8888888888888888"
+
+	next := &Config{
+		Listen:           "127.0.0.1:0",
+		IndexNowEndpoint: engine.server.URL,
+		Sites: []Site{
+			{
+				Host:        "example.com",
+				IndexNowKey: testFixtureKey(),
+				KeyLocation: "https://example.com/" + testFixtureKey() + ".txt",
+				Token:       testToken,
+			},
+			{
+				Host:        otherHost,
+				IndexNowKey: secondKey,
+				KeyLocation: origin.URL + "/" + secondKey + ".txt",
+				Token:       otherToken,
+			},
+		},
+	}
+
+	if err := srv.applyConfig(context.Background(), next); err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+
+	// No wait and no sleep: the assertion holds before the background check lands
+	// (the record is absent, which is pending) and after it (the record is
+	// failed), so waiting would only make the test slower.
+	if got := keyStateFor(srv, otherHost); got == keyStateVerified {
+		t.Fatalf("a re-added host inherited the old verdict: state = %q", got)
 	}
 }
