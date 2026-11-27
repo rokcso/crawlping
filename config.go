@@ -107,6 +107,14 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
+	return parseConfig(raw)
+}
+
+// parseConfig validates config bytes that have no path yet. Reading is split
+// from validating because `site add` writes a file it has just edited: it holds
+// the bytes and not a file, and the two must agree on what a valid config is or
+// that command can write a file the service then refuses to start on.
+func parseConfig(raw []byte) (*Config, error) {
 	var cfg Config
 	decoder := yaml.NewDecoder(strings.NewReader(string(raw)))
 	decoder.KnownFields(true)
