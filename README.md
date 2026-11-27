@@ -462,12 +462,17 @@ One file per concern, in the order they are used rather than alphabetically.
 | | `inflight.go` | the semaphores that bound concurrent engine work |
 | | `window.go` | the five-minute table that remembers what was just sent |
 
-Each file above has a `_test.go` beside it. Two do not test a file:
+Most files above have a `_test.go` beside them. Some tests name the behaviour
+rather than the file, because that is what they are about: `reload_test.go`
+covers the SIGHUP promise and `check_test.go` covers the `check` command. The
+per-host key verdict in `keys.go` has no file of its own on purpose - it is
+exercised through the submit path and the health handlers, which is how a caller
+reaches it. Two more test the repository against itself rather than a file:
 `docs_test.go` checks the endpoint table above against the routes that serve it,
-in both directions, and `changelog_test.go` checks `CHANGELOG.md` against what
-the release script reads. `scripts/compose-smoke.sh` is the only test that sees
-the assembled container, and it exists for the failure the unit tests cannot
-reach - a container that builds, starts, and is unreachable from the host.
+in both directions, and `changelog_test.go` checks `CHANGELOG.md` against what the
+release script reads. `scripts/compose-smoke.sh` is the only test that sees the
+assembled container, and it exists for the failure the unit tests cannot reach:
+a container that builds, starts, and is unreachable from the host.
 
 ## Releasing
 
