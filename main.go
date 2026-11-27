@@ -110,6 +110,31 @@ the listen address comes from the config file.
 `, version, configEnv)
 }
 
+// The HTTP server's timeouts. Only serverWriteTimeout has arithmetic behind it,
+// and it is derived from the two numbers in other files that decide how long an
+// answerable request may take.
+const (
+	// serverReadHeaderTimeout bounds the request line and the headers, so a
+	// client that opens a connection and then says nothing cannot hold it.
+	serverReadHeaderTimeout = 5 * time.Second
+	// serverReadTimeout bounds reading the request: headers included, and it is
+	// the first term of serverWriteTimeout below.
+	serverReadTimeout = 15 * time.Second
+	// serverWriteTimeout bounds the time from the end of the request headers to
+	// the last byte of the response, so it wraps work that has nothing to do
+	// with writing: the body read (serverReadTimeout, 15s), then the wait for an
+	// engine slot (inFlightWait, 2s), then the engine call itself (engineTimeout,
+	// 15s). That sum is 32s, so this is 40s rather than 30s: at 30s a slow body
+	// plus a slow engine had the connection closed mid-write, which turned an
+	// overloaded or engine_error the caller could act on into a dropped
+	// connection. It is derived from those three, so raising any of them means
+	// raising this one; timeout_test.go pins the sum.
+	serverWriteTimeout = 40 * time.Second
+	// serverIdleTimeout bounds a kept-alive connection between two requests, so a
+	// caller that submits in bursts does not pay for a handshake every time.
+	serverIdleTimeout = 60 * time.Second
+)
+
 func cmdServe(args []string) error {
 	configPath := configFlag("serve", args)
 
@@ -163,10 +188,10 @@ func cmdServe(args []string) error {
 	// there is one place that decides what is bound and one place that can fail.
 	httpServer := &http.Server{
 		Handler:           srv.routes(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}
 
 	// Bind before any network check runs. net.Listen returns at once, so a port

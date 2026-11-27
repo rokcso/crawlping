@@ -54,6 +54,10 @@ jobs:
           fi
           go vet ./...
           go test ./...
+          # -race is the cheapest check this design allows: the runtime is swapped
+          # through an atomic.Pointer, and the semaphores and the mutex-guarded
+          # maps are where a data race would only show up under load.
+          go test -race ./...
 
       # The release job depends on this script, and a shell script that only ever
       # runs at tag time fails at the worst possible moment. Running it here, on
@@ -99,6 +103,9 @@ jobs:
           fi
           go vet ./...
           go test ./...
+          # Same race detector run as the test job: a tag push is the one trigger
+          # where that job is gated off, and this is the job that publishes.
+          go test -race ./...
 
       # Same check as the test job: a tag can be pushed without a pull request,
       # and the binaries and the image must come from the same Go version.
