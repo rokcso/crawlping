@@ -71,6 +71,19 @@ type initResult struct {
 	host       string
 	key        string
 	shape      string
+	// previous is what a replaced config was using. Empty unless -force
+	// overwrote a config that loaded.
+	previous *previousKey
+}
+
+// previousKey is the key a config used before this run replaced it. It is
+// captured because -force writes a new key and cannot deploy it: the site goes
+// on serving the old file, so every submission fails 403 until somebody puts
+// the new one up. Naming the file that is now orphaned is the least this can
+// do about a rotation nobody asked for.
+type previousKey struct {
+	key      string
+	location string
 }
 
 // initShape is everything a deployment shape decides: the listen address, the
@@ -159,6 +172,16 @@ func runInit(w io.Writer, opts initOptions) error {
 		}
 	}
 
+	// Read the config this run is about to replace, before replacing it. A
+	// config that does not load is not an error here - replacing a broken one
+	// is presumably why -force was passed - so a read failure is not reported.
+	var previous *previousKey
+	if opts.force {
+		if old, err := loadConfig(configPath); err == nil && len(old.Sites) > 0 {
+			previous = &previousKey{key: old.Sites[0].IndexNowKey, location: old.Sites[0].KeyLocation}
+		}
+	}
+
 	// The key file goes first. If the second write fails there is then an
 	// unused key file and no config, rather than a config naming a key file
 	// that was never written.
@@ -183,6 +206,7 @@ func runInit(w io.Writer, opts initOptions) error {
 		host:       host,
 		key:        key,
 		shape:      opts.shape,
+		previous:   previous,
 	}, shape)
 
 	return nil
@@ -349,6 +373,16 @@ func printChecklist(w io.Writer, res initResult, shape initShape) {
 	fmt.Fprintf(w, "  check  %s\n", shape.check[0])
 	for _, line := range shape.check[1:] {
 		fmt.Fprintf(w, "         %s\n", line)
+	}
+
+	// A -force run generates a new key and cannot deploy it, so the old file is
+	// now orphaned while the site still serves it. Saying so is the difference
+	// between a rotation and an outage whose cause is invisible.
+	if res.previous != nil && res.previous.key != res.key {
+		fmt.Fprintf(w, "\n  rotate this run replaced a working key. %s was the old one\n", res.previous.location)
+		fmt.Fprintf(w, "         and the site still serves it: submissions fail with 403\n")
+		fmt.Fprintf(w, "         key_rejected until the new file above is deployed. Delete the old\n")
+		fmt.Fprintf(w, "         one once it is.\n")
 	}
 }
 

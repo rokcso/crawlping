@@ -560,3 +560,41 @@ func readConfigForTest(t *testing.T, dir string) *Config {
 
 	return cfg
 }
+
+func TestInitForceSaysItRotatedTheKey(t *testing.T) {
+	// -force writes a new key, and it cannot deploy it: the site keeps serving
+	// the old file, so every submission is refused 403 until somebody notices.
+	// The checklist has to name the file that just became orphaned, or the
+	// rotation is an outage with an invisible cause.
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	old := `
+sites:
+  - host: example.com
+    indexnow_key: "oldkey0123456789"
+    token: "test-token-0000000000000000"
+`
+	if err := os.WriteFile(configPath, []byte(old), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	out := runInitInto(t, initOptions{dir: dir, host: "example.com", shape: shapeDocker, force: true})
+
+	if !strings.Contains(out, "rotate") {
+		t.Fatalf("the checklist does not mention the key change:\n%s", out)
+	}
+	// The old key file's address, not just the fact that something changed.
+	if !strings.Contains(out, "https://example.com/oldkey0123456789.txt") {
+		t.Fatalf("the checklist does not name the orphaned key file:\n%s", out)
+	}
+	if !strings.Contains(out, "403") {
+		t.Fatalf("the checklist does not say what breaks:\n%s", out)
+	}
+
+	// A first run has nothing to rotate, so it must not print the warning.
+	fresh := runInitInto(t, initOptions{dir: t.TempDir(), host: "example.com", shape: shapeDocker})
+	if strings.Contains(fresh, "rotate") {
+		t.Fatalf("a first run warned about a rotation:\n%s", fresh)
+	}
+}
