@@ -257,8 +257,23 @@ engine throttles it, not the caller:
 
 - **10 requests back to back per host**, then one more per second. The burst and
 the refill are per host, so one noisy site cannot silence another.
-- **8 engine requests in flight at once**, across every site. A request that
-finds no free slot waits up to 2 seconds for one, then gives up.
+- **8 engine requests in flight at once**, across every site, and **at most 4 of
+them for one site** when this instance serves more than one. A request that
+finds no free slot waits up to 2 seconds for one, then gives up. The two
+refusals are reported separately because they ask for different things: the
+`detail` says whether this site had used its own share or the instance had used
+its, so the caller knows whether to slow one site down or all of them.
+- A config with a **single site keeps all 8**. With one host a per-host cap could
+only duplicate the global one, and halving it would throw away half the engine
+concurrency the deployment is allowed, for a starvation problem that cannot
+exist with one site.
+
+The per-site share is a ceiling, not a reservation: a second site that is idle
+still costs the busy one its other four slots. That is deliberate. Concurrency is
+not the bottleneck here - the token bucket above is, and a hundred batches wait
+about ninety seconds for tokens however many slots are open - so the four slots
+buy a guaranteed share for a neighbour at a price the rate limit has already
+made irrelevant.
 
 IndexNow does not publish its limits, so these are deliberately conservative.
 They exist to keep a leaked token or a retry loop in one caller from pushing the
@@ -439,6 +454,50 @@ A recheck that runs out of its 5 second budget leaves the recorded state alone
 rather than downgrading a good key because this instance ran out of patience,
 and a recheck is refused without a token like any other detail request.
 
+### `GET /metrics`
+
+Prometheus text format, for the operator rather than for the caller. Everything
+here was already written to the log as one JSON line per submission; the point of
+the endpoint is that a trend is only visible once it is aggregated, and IndexNow
+does not publish its limits, so the trend is the only warning you get before
+`429`.
+
+```
+crawlping_submissions_total{host}                            counter
+crawlping_submission_reasons_total{host,reason}              counter
+crawlping_engine_requests_total{host,status}                 counter
+crawlping_engine_duration_seconds{host}                      histogram
+crawlping_urls_submitted_total{host}                         counter
+crawlping_urls_skipped_total{host}                           counter
+crawlping_guard_refusals_total{host,kind}                    counter
+crawlping_key_state{host}                                    gauge
+```
+
+`kind` is `throttled` (this instance's own rate bucket) or `overloaded` (no
+engine slot). `crawlping_key_state` is `0` pending, `1` verified, `2` failed, the
+same three states `/health` reports. A family with no observation yet carries its
+`HELP` and `TYPE` lines and no series, so a scrape before the first submission is
+not an error.
+
+**The host label follows the rule `/health` already follows.** Without a token
+every family is aggregated and carries no `host` label at all, because a
+Cloudflare Tunnel makes this endpoint publicly reachable and the domain list is
+not public information. A token unlocks the labels:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/metrics
+```
+
+Any configured site token does, not one per site: a token is something the
+operator issued in the config file, not a user account, and a series set that
+depended on which token was used would break scraping. When the labels are
+aggregated, `crawlping_key_state` is reported as a count per state rather than as
+one number, since adding up `0`, `1` and `2` across hosts would mean nothing.
+
+No label is ever a URL, a path, a query, a user agent or a remote address.
+`host` is bounded by the config, `reason` is the closed vocabulary below, and
+`status` is a small set; anything else would be a memory leak the caller controls.
+
 ### Key states
 
 Every host is in exactly one of three states. Two of them are facts about the key
@@ -499,7 +558,7 @@ Your caller decides whether to retry.
 | 429 | `rate_limited` | the engine is throttling this IP; see `Retry-After` | yes, later |
 | 429 | `throttled` | this instance refused to spend any more of its egress IP on this host right now; the engine was not called | yes, after `Retry-After` |
 | 502 | `engine_error` | engine 5xx or the request never landed | yes, later |
-| 503 | `overloaded` | every engine slot was in use and none freed up within 2 seconds; the engine was not called | yes, shortly |
+| 503 | `overloaded` | no engine slot freed up within 2 seconds; `detail` says whether this site had used its own share or the whole instance had. The engine was not called | yes, shortly |
 
 Only `429`, `502` and `503` are worth retrying. Every other status is the same
 answer if the identical request is sent again. `engine_rejected` is the one to
