@@ -197,6 +197,11 @@ func (m *submissionMetrics) hostFor(host string) *hostMetrics {
 // histogram has to take exactly one sample per engine call and none for a batch
 // that never left this process.
 //
+// Every request this handler handled lands here exactly once, so submissions_total
+// is the whole of what it answered - accepted, refused locally, or sent to the
+// engine - and both the reason family and the guard family are breakdowns of that
+// one count rather than totals of their own.
+//
 // A submission with no engine status contributes no engine series: reporting a
 // status no engine sent would be the metrics version of the wrong engine_status
 // in the response.
@@ -204,6 +209,15 @@ func (m *submissionMetrics) record(host string, result submissionResult, engineC
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.recordLocked(host, result, engineCall, invoked)
+}
+
+// recordLocked is record under a lock the caller already holds, for a caller that
+// has a second counter to raise on the same record. One handler event is one lock
+// acquisition, so a scrape never sees a submission whose guard kind has not been
+// counted yet. It returns the host's counters so the caller adds to them under the
+// lock it took rather than taking it again.
+func (m *submissionMetrics) recordLocked(host string, result submissionResult, engineCall time.Duration, invoked bool) *hostMetrics {
 	counters := m.hostFor(host)
 	counters.submissions++
 	counters.reasons[reasonLabel(result.Reason)]++
@@ -217,6 +231,8 @@ func (m *submissionMetrics) record(host string, result submissionResult, engineC
 	if invoked {
 		counters.duration.observe(engineCall.Seconds())
 	}
+
+	return counters
 }
 
 // recordRefusal accumulates a submission refused before a result exists: the body
@@ -227,15 +243,22 @@ func (m *submissionMetrics) recordRefusal(host, reason string) {
 }
 
 // recordGuardRefusal accumulates one submission the guard refused before the
-// engine was called. Only the guard's two kinds are recorded here; they are the
-// same strings as the reasons the caller sees, on purpose, because one refusal
-// is one reason and one kind and reusing the constants keeps them from drifting
-// apart.
+// engine was called. The guard answered it, so it is one of the requests
+// submissions_total counts, with the reason the caller sees: counting it only
+// under guardRefusals would leave the submissions family missing exactly the
+// throttled and overloaded traffic an operator opens /metrics to find, and would
+// leave submissions and reasons as two numbers that do not add up.
+//
+// No engine status and no latency sample, because nothing was sent. Only the
+// guard's two kinds are recorded here; they are the same strings as the reasons
+// the caller sees, on purpose, because one refusal is one reason and one kind and
+// reusing the constants keeps them from drifting apart.
 func (m *submissionMetrics) recordGuardRefusal(host, kind string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.hostFor(host).guardRefusals[kind]++
+	counters := m.recordLocked(host, submissionResult{Reason: kind}, 0, false)
+	counters.guardRefusals[kind]++
 }
 
 // metricsSnapshot is one consistent reading of every counter: the families in a
@@ -372,7 +395,8 @@ func writeMetrics(w io.Writer, snapshot metricsSnapshot, keyStates map[string]ke
 	series := snapshot.series(perHost)
 	e := exposition{w: w}
 
-	e.header("crawlping_submissions_total", "Submissions handled, per host.", "counter")
+	e.header("crawlping_submissions_total",
+		"Every request this handler handled, per host - accepted, refused locally, or answered by the engine.", "counter")
 	for _, current := range series {
 		e.sample("crawlping_submissions_total", formatInt(current.record.submissions), hostLabels(current.host)...)
 	}
@@ -423,7 +447,9 @@ func writeMetrics(w io.Writer, snapshot metricsSnapshot, keyStates map[string]ke
 		e.sample("crawlping_urls_skipped_total", formatInt(current.record.urlsSkipped), hostLabels(current.host)...)
 	}
 
-	e.header("crawlping_guard_refusals_total", "Submissions refused locally before the engine was called, per host and kind.", "counter")
+	e.header("crawlping_guard_refusals_total",
+		"Locally refused requests, per host and kind - the per-kind breakdown of the ones already in crawlping_submissions_total, not a separate total.",
+		"counter")
 	for _, current := range series {
 		for _, kind := range sortedCounters(current.record.guardRefusals) {
 			e.sample("crawlping_guard_refusals_total", formatInt(current.record.guardRefusals[kind]),

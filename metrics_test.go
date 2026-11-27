@@ -234,12 +234,15 @@ func TestMetricsCountGuardRefusalsByKind(t *testing.T) {
 		if got := metricValue(t, body, `crawlping_guard_refusals_total{host="example.com",kind="throttled"}`); got != 1 {
 			t.Fatalf("throttled guard refusals = %v, want 1", got)
 		}
-		// A guard refusal is not a submission: it never became one.
-		if got := metricValue(t, body, `crawlping_submissions_total{host="example.com"}`); got != rateBurstTokens {
-			t.Fatalf("submissions = %v, want the %d that were sent", got, rateBurstTokens)
+		// The guard answered the request, so it is one of the requests this
+		// handler handled and the reason family says which kind of answer it
+		// got. A refusal that showed up only under guard_refusals_total would
+		// leave submissions and reasons as two numbers that do not add up.
+		if got := metricValue(t, body, `crawlping_submissions_total{host="example.com"}`); got != rateBurstTokens+1 {
+			t.Fatalf("submissions = %v, want the %d that were sent plus the one throttled", got, rateBurstTokens)
 		}
-		if _, found := findMetric(body, `crawlping_submission_reasons_total{host="example.com",reason="throttled"}`); found {
-			t.Fatalf("a guard refusal was counted as a submission reason:\n%s", body)
+		if got := metricValue(t, body, `crawlping_submission_reasons_total{host="example.com",reason="throttled"}`); got != 1 {
+			t.Fatalf("throttled reasons = %v, want 1", got)
 		}
 	})
 
@@ -263,16 +266,84 @@ func TestMetricsCountGuardRefusalsByKind(t *testing.T) {
 		if got := metricValue(t, body, `crawlping_guard_refusals_total{host="example.com",kind="overloaded"}`); got != 1 {
 			t.Fatalf("overloaded guard refusals = %v, want 1", got)
 		}
-		// The host now has a counters record, and every counter in it is zero:
-		// the request was refused before it became a submission, so it must not
-		// show up as one.
-		if got := metricValue(t, body, `crawlping_submissions_total{host="example.com"}`); got != 0 {
-			t.Fatalf("submissions = %v, want 0 (the request never became one)", got)
+		// The one request this host made never reached the engine, so it is one
+		// handled submission and one reason, and the histogram still has no
+		// sample: the guard's answer is not an engine latency.
+		if got := metricValue(t, body, `crawlping_submissions_total{host="example.com"}`); got != 1 {
+			t.Fatalf("submissions = %v, want 1 (the request the guard answered)", got)
+		}
+		if got := metricValue(t, body, `crawlping_submission_reasons_total{host="example.com",reason="overloaded"}`); got != 1 {
+			t.Fatalf("overloaded reasons = %v, want 1", got)
 		}
 		if got := metricValue(t, body, `crawlping_engine_duration_seconds_count{host="example.com"}`); got != 0 {
 			t.Fatalf("duration samples = %v, want 0 (no engine call)", got)
 		}
 	})
+}
+
+func TestMetricsCountAGuardRefusalAsASubmission(t *testing.T) {
+	// One refusal, counted directly: the guard's two kinds are reasons a request
+	// got, so the request is one submission, one reason and one kind. It is not an
+	// engine request and not a latency sample, because nothing was sent.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	srv.metrics.recordGuardRefusal("example.com", "throttled")
+
+	body := metricsText(t, srv, "Bearer "+testToken)
+
+	if got := metricValue(t, body, `crawlping_submissions_total{host="example.com"}`); got != 1 {
+		t.Fatalf("submissions = %v, want 1", got)
+	}
+	if got := metricValue(t, body, `crawlping_submission_reasons_total{host="example.com",reason="throttled"}`); got != 1 {
+		t.Fatalf("throttled reasons = %v, want 1", got)
+	}
+	if got := metricValue(t, body, `crawlping_guard_refusals_total{host="example.com",kind="throttled"}`); got != 1 {
+		t.Fatalf("throttled guard refusals = %v, want 1", got)
+	}
+	if strings.Contains(body, `crawlping_engine_requests_total{`) {
+		t.Fatalf("a guard refusal produced an engine series:\n%s", body)
+	}
+	if got := metricValue(t, body, `crawlping_engine_duration_seconds_count{host="example.com"}`); got != 0 {
+		t.Fatalf("duration samples = %v, want 0 (no engine call)", got)
+	}
+	if got := engine.calls(); got != 0 {
+		t.Fatalf("engine calls = %d, want 0", got)
+	}
+}
+
+func TestMetricsDoNotDoubleCountAGuardRefusal(t *testing.T) {
+	// One accepted submission and one guard refusal for the same host are two
+	// requests this handler handled, so submissions is their sum and reasons is
+	// the same two under two labels. A guard refusal added to a separate total
+	// would make one of these requests invisible to the submissions family.
+	engine := newFakeEngine(t, http.StatusOK)
+	srv := newTestServer(t, engine)
+
+	if recorder, _ := postURL(t, srv, "Bearer "+testToken, "https://example.com/a"); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", recorder.Code, recorder.Body.String())
+	}
+
+	srv.metrics.recordGuardRefusal("example.com", "throttled")
+
+	body := metricsText(t, srv, "Bearer "+testToken)
+
+	if got := metricValue(t, body, `crawlping_submissions_total{host="example.com"}`); got != 2 {
+		t.Fatalf("submissions = %v, want 2 (one accepted, one throttled)", got)
+	}
+	if got := metricValue(t, body, `crawlping_submission_reasons_total{host="example.com",reason="accepted"}`); got != 1 {
+		t.Fatalf("accepted reasons = %v, want 1", got)
+	}
+	if got := metricValue(t, body, `crawlping_submission_reasons_total{host="example.com",reason="throttled"}`); got != 1 {
+		t.Fatalf("throttled reasons = %v, want 1", got)
+	}
+	if got := metricValue(t, body, `crawlping_guard_refusals_total{host="example.com",kind="throttled"}`); got != 1 {
+		t.Fatalf("throttled guard refusals = %v, want 1", got)
+	}
+	// The refusal was the only request that never reached the engine.
+	if got := metricValue(t, body, `crawlping_engine_duration_seconds_count{host="example.com"}`); got != 1 {
+		t.Fatalf("duration samples = %v, want 1", got)
+	}
 }
 
 func TestMetricsObserveOneDurationSamplePerEngineCall(t *testing.T) {
