@@ -55,6 +55,14 @@ jobs:
           go vet ./...
           go test ./...
 
+      # The release job depends on this script, and a shell script that only ever
+      # runs at tag time fails at the worst possible moment. Running it here, on
+      # a pull request, keeps that surprise off the release path.
+      - name: Extract a changelog entry
+        run: |
+          set -euo pipefail
+          sh scripts/changelog-notes.sh v0.1.0 | head -5
+
       # The unit tests cannot see the assembly. This project broke twice in
       # ways no test caught: a container with no published port, and an example
       # config whose listen address could never be reached through the
@@ -124,6 +132,17 @@ jobs:
       # multi-arch, but people who run without Docker want a plain binary, and
       # producing both from one Go toolchain keeps them at the same version
       # (the step above is what keeps that claim true).
+      # Checked here, before anything is built or pushed, and not at the publish
+      # step: a tag whose version was never written in CHANGELOG.md should fail
+      # while there is still nothing to undo. Discovering it after the image is on
+      # GHCR would leave a published image with no release beside it.
+      - name: Read the changelog entry for this release
+        run: |
+          set -euo pipefail
+          sh scripts/changelog-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
+          echo "--- release body, from CHANGELOG.md ---"
+          cat "$RUNNER_TEMP/release-notes.md"
+
       - name: Build binaries
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -209,19 +228,10 @@ jobs:
             flags=()
             [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
 
-            # --generate-notes builds the body from commit subjects, which is
-            # exactly what a breaking change does not show up in: "/health no
-            # longer returns a per-host map" is not a sentence any commit
-            # subject carries, and somebody upgrading reads the release, not the
-            # log. A hand-written file wins when one exists; the generated notes
-            # stay the default so a routine tag needs no extra file.
-            notes_file="docs/release-notes/${GITHUB_REF_NAME}.md"
-            if [ -f "$notes_file" ]; then
-              echo "using $notes_file for the release body"
-              flags+=(--notes-file "$notes_file")
-            else
-              flags+=(--generate-notes)
-            fi
+            # The body is the CHANGELOG section, read before anything was built.
+            # No fallback to --generate-notes: generated notes come from commit
+            # subjects, which is precisely where a breaking change does not appear.
+            flags+=(--notes-file "$RUNNER_TEMP/release-notes.md")
 
             gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
           fi

@@ -247,7 +247,7 @@ library, which keeps the image at ~9 MB.
 Tag-driven, and the tag is the only trigger:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
 `.github/workflows/release.yml` then runs the tests, cross-compiles five
@@ -258,11 +258,13 @@ GitHub release with the archives and `checksums.txt` attached.
 A tag containing a hyphen (`v0.2.0-rc1`) is published as a prerelease and does
 not move `latest`.
 
-The release body is generated from the commit subjects **unless**
-`docs/release-notes/<tag>.md` exists, in which case that file is used verbatim.
-Write one for any release with a breaking change: a generated body cannot say
-"`/health` no longer returns a per-host map", and somebody upgrading reads the
-release rather than the log. `docs/release-notes/v0.2.0.md` is the worked example.
+The release body is the `CHANGELOG.md` section for that version, read before
+anything is built. A tag whose version was never written there fails the
+workflow while there is still nothing to undo, rather than publishing an image
+with no release beside it. What to write, and the four headings to write it
+under, is at the top of [CHANGELOG.md](CHANGELOG.md).
+
+So the order is: write the entry, move it out of `Unreleased`, then tag.
 
 What the workflow deliberately does not do: no goreleaser, no cosign, no SBOM.
 At this size those are ceremony rather than protection - the build is
