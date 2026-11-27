@@ -59,6 +59,23 @@ func freePort(t *testing.T) string {
 	return address
 }
 
+// configFileAtMode leaves a file at an exact mode, which os.WriteFile alone
+// cannot promise: the umask decides what the 0600 in the call becomes, so the
+// chmod afterwards is what the check under test actually reads.
+func configFileAtMode(t *testing.T, mode os.FileMode) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), initConfigName)
+	if err := os.WriteFile(path, []byte("listen: 8080\nsites: []\n"), initConfigMode); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("chmod %04o: %v", mode, err)
+	}
+
+	return path
+}
+
 func TestDoctorPassesOnAWorkingDeployment(t *testing.T) {
 	key := testFixtureKey()
 	origin := doctorKeyServer(t, key, func(w http.ResponseWriter, _ *http.Request) {
@@ -159,6 +176,91 @@ func TestDoctorFailsAConfigThatDoesNotLoad(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "does not load") {
 		t.Fatalf("doctor did not name the config as the failure:\n%s", out.String())
+	}
+}
+
+func TestDoctorPassesAPrivateConfigMode(t *testing.T) {
+	// 0600 is what init and site add write, and the reason they bother: the file
+	// holds every site's token. A check that is noisy here is a check an operator
+	// learns to skip.
+	path := configFileAtMode(t, initConfigMode)
+
+	report := &doctorReport{}
+	var out bytes.Buffer
+	checkConfigMode(report, &out, path)
+
+	printed := out.String()
+	if report.failed != 0 {
+		t.Fatalf("checkConfigMode counted %d failures for a 0600 config:\n%s", report.failed, printed)
+	}
+	if !strings.HasPrefix(printed, "ok") || !strings.Contains(printed, "0600") {
+		t.Fatalf("checkConfigMode did not report 0600 as private:\n%s", printed)
+	}
+	if lines := strings.Count(strings.TrimSuffix(printed, "\n"), "\n") + 1; lines != 1 {
+		t.Fatalf("checkConfigMode printed %d lines for a private mode, want the one ok line:\n%s", lines, printed)
+	}
+}
+
+func TestDoctorFailsAWorldReadableConfig(t *testing.T) {
+	// The defect the check exists for: the same file after an editor, a cp from a
+	// backup or a chmod -R. Every token in it is now readable by any account on
+	// the machine, and nothing else in the deployment has changed.
+	path := configFileAtMode(t, 0o644)
+
+	report := &doctorReport{}
+	var out bytes.Buffer
+	checkConfigMode(report, &out, path)
+
+	printed := out.String()
+	if report.failed != 1 {
+		t.Fatalf("checkConfigMode counted %d failures for a 0644 config, want 1:\n%s", report.failed, printed)
+	}
+	for _, want := range []string{"FAIL", "0644", "chmod 600 " + path} {
+		if !strings.Contains(printed, want) {
+			t.Fatalf("checkConfigMode output never mentions %q:\n%s", want, printed)
+		}
+	}
+}
+
+func TestDoctorAcceptsAReadOnlyConfigMode(t *testing.T) {
+	// 0400 leaks nothing, and requiring exactly 0600 would fail it. A check that
+	// refuses a correct file is worse than one that says nothing: the operator
+	// fixes the file, doctor keeps failing, and the next real failure is ignored.
+	path := configFileAtMode(t, 0o400)
+
+	report := &doctorReport{}
+	var out bytes.Buffer
+	checkConfigMode(report, &out, path)
+
+	printed := out.String()
+	if report.failed != 0 {
+		t.Fatalf("checkConfigMode failed a 0400 config:\n%s", printed)
+	}
+	if !strings.HasPrefix(printed, "ok") || !strings.Contains(printed, "0400") {
+		t.Fatalf("checkConfigMode did not accept 0400 as private:\n%s", printed)
+	}
+}
+
+func TestDoctorReturnsAnErrorForALooseConfigMode(t *testing.T) {
+	// The mode is a check like the others, so it has to reach the exit status:
+	// a deployment whose config anyone can read is not healthy even when the
+	// key files, the port and the engine are all fine.
+	key := testFixtureKey()
+	origin := doctorKeyServer(t, key, func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	})
+	defer origin.Close()
+
+	path := configFileAtMode(t, 0o644)
+	cfg := doctorTestConfig(origin.URL+"/"+key+".txt", freePort(t), origin.URL)
+
+	var out bytes.Buffer
+	err := doctorConfig(&out, cfg, path)
+	if err == nil {
+		t.Fatalf("doctor passed a config file anyone can read:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "FAIL  mode") {
+		t.Fatalf("doctor failed for a reason other than the mode: %v\n%s", err, out.String())
 	}
 }
 

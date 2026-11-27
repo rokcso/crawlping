@@ -4,8 +4,9 @@ package main
 // deployment usable, not just is each key file right. It exists because a
 // deployment that looks fine can fail in ways that are invisible from inside:
 // the key file is served by the site's fallback page (a 200 that is HTML), the
-// port the config names is held by something else, or the machine cannot reach
-// the engine at all.
+// config file sits at 0644 so every token in it is readable by anyone on the
+// box, the port the config names is held by something else, or the machine
+// cannot reach the engine at all.
 //
 // It is read-only on purpose. Every check here is a fact about the machine it
 // runs on, and nothing is submitted: doctor must be safe to run on a production
@@ -92,6 +93,10 @@ func doctorConfig(out io.Writer, cfg *Config, configPath string) error {
 	report := &doctorReport{}
 	report.ok(out, "config", "%s, %d sites, endpoint %s", configPath, len(cfg.Sites), cfg.IndexNowEndpoint)
 
+	// Only the path, but it belongs between the config that loaded and the checks
+	// that need the machine: the order of the report is only readable here.
+	checkConfigMode(report, out, configPath)
+
 	checkListen(report, out, cfg)
 	checkEngine(report, out, cfg.IndexNowEndpoint)
 	checkKeyFiles(report, out, cfg)
@@ -106,6 +111,32 @@ func doctorConfig(out io.Writer, cfg *Config, configPath string) error {
 	}
 
 	return nil
+}
+
+// checkConfigMode reports who else can read the file every site's token is in.
+//
+// init and site add write it 0600 and the README's Docker story depends on that,
+// but nothing ever checked it: an editor that replaces the file, a cp from a
+// backup or a chmod -R leaves it 0644, and both serve and doctor read it as if
+// nothing happened. Only the group and other bits are judged, because 0400 and
+// 0700 are private too and failing them would be wrong.
+func checkConfigMode(report *doctorReport, out io.Writer, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		// loadConfig has already opened this file, so a stat that fails here says
+		// nothing about its mode; doctor does not print a line for a file it was
+		// never given.
+		return
+	}
+
+	perm := info.Mode().Perm()
+	if perm&0o077 == 0 {
+		report.ok(out, "mode", "%04o, readable only by the owner", perm)
+		return
+	}
+
+	report.fail(out, "mode", "%04o, so group or other has access to the config", perm)
+	report.note(out, "run chmod 600 %s: the file holds every site's bearer token", path)
 }
 
 // checkListen reports whether the configured address can be bound.
