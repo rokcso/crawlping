@@ -50,7 +50,30 @@ The image is public: `docker pull` needs no `docker login`.
 
 ## Quick start
 
-Generate a token and copy the example config (mode `0600` - it holds tokens):
+Write a working setup, then read it before trusting it:
+
+```bash
+crawlping init -host example.com             # add -shape binary|tunnel if not Docker
+```
+
+That writes two files and nothing else: `config.yaml`, mode `0600`, carrying a
+generated IndexNow key and a generated bearer token; and `<key>.txt`, the file
+the site has to serve. It then prints what to do with both - the Worker route or
+the `cp` into whichever directory the site publishes - the command that starts
+the service for the shape you chose, and `crawlping check` as the next step.
+
+It refuses to replace a file that already exists without `-force`, and `-force`
+replaces the key too, so its output names the key file that just became orphaned:
+the site goes on serving the old one, and submissions are refused `403` until the
+new one is deployed.
+
+`-shape` is the flag worth reading about, because it decides the one line that
+costs the most to get wrong. `docker` (the default) writes `listen:
+"0.0.0.0:8080"`, because Docker forwards a published port to the container's
+eth0 and never to its loopback; `binary` and `tunnel` write `127.0.0.1:8080`,
+where there is no container boundary to cross and no port is published.
+
+Doing it by hand is the same two files:
 
 ```bash
 openssl rand -hex 32
@@ -58,8 +81,7 @@ cp config.example.yaml config.yaml
 chmod 600 config.yaml
 ```
 
-Which shape you deploy decides one line of that file - `listen:`. Everything
-below assumes the config is at `./config.yaml`.
+Everything below assumes the config is at `./config.yaml`.
 
 The other key worth knowing is `indexnow_endpoint`. It defaults to the global
 `https://api.indexnow.org/indexnow`, and leaving it alone is right for almost
