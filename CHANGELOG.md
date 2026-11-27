@@ -27,6 +27,8 @@ Five rules, and they are the whole convention:
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-27
+
 ### Breaking
 
 - **The container has to run as your uid, and the config has to be mounted as a
@@ -46,8 +48,10 @@ rename, so a `SIGHUP` reload reads the old inode and the site count never change
   The in-container path is unchanged, so no other flag moves. Add `user:
   "1000:1000"` to compose. Then `chown` the config to your own uid and drop any
   `chown 65532` you added to work around the old failure. Restarting once here is
-  fine; the reload matters after this point. No API change: `/submit`, `/health`
-  and `/metrics` are as v0.2.0 left them.
+  fine; the reload matters after this point. No caller-side change: `/submit` and
+  `/health` take the same requests and answer the same shapes. `/metrics` counts
+  guard refusals differently, which its own entry below describes.
+
 ### Added
 
 - `crawlping site add -host ...` generates the key and token, appends the entry,
