@@ -10,9 +10,44 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// logBuffer is a buffer a server can log to while a test reads it.
+//
+// These tests start a server and then read what it wrote, and a reload that adds
+// a host starts a background key-file check, which logs from its own goroutine.
+// A strings.Builder shared that way is a data race the test would only lose
+// sometimes - and CI now runs this package under -race, so "sometimes" is a
+// flaky build rather than a rare surprise. The mutex is the whole reason this
+// type exists.
+type logBuffer struct {
+	mu sync.Mutex
+	sb strings.Builder
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.sb.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.sb.String()
+}
+
+func (b *logBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.sb.Reset()
+}
 
 // The reload tests are about the promise SIGHUP makes: the site list changes,
 // and nothing else does. A reload is not a restart, so everything a restart
@@ -235,7 +270,7 @@ func TestReloadReusesOneClientForTheWholeRuntime(t *testing.T) {
 
 func TestReloadLogsWhatChanged(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
-	var logs strings.Builder
+	var logs logBuffer
 	srv := newServer(&Config{
 		Listen: "127.0.0.1:0",
 		Sites: []Site{{
@@ -344,7 +379,7 @@ func TestReloadWarnsWhenTheFileDidNotChange(t *testing.T) {
 	// new site is not there. Nothing can be fixed from inside that inode, so the
 	// line has to say what to change.
 	engine := newFakeEngine(t, http.StatusOK)
-	var logs strings.Builder
+	var logs logBuffer
 	srv := newServer(&Config{
 		Listen: "127.0.0.1:0",
 		Sites: []Site{{
@@ -376,7 +411,7 @@ func TestReloadWarnsWhenTheFileDidNotChange(t *testing.T) {
 
 func TestReloadDoesNotWarnWhenTheFileReallyChanged(t *testing.T) {
 	engine := newFakeEngine(t, http.StatusOK)
-	var logs strings.Builder
+	var logs logBuffer
 	srv := newServer(&Config{
 		Listen: "127.0.0.1:0",
 		Sites: []Site{{
@@ -526,7 +561,7 @@ func TestReloadWarnsWhenThePerSiteShareWouldChange(t *testing.T) {
 	// number is kept, and the line has to say both numbers, because otherwise an
 	// operator reads the documented split and believes it is in force.
 	engine := newFakeEngine(t, http.StatusOK)
-	var logs strings.Builder
+	var logs logBuffer
 	srv := newServer(&Config{
 		Listen:           "127.0.0.1:0",
 		IndexNowEndpoint: engine.server.URL,
