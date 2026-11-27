@@ -443,6 +443,32 @@ docker build -t crawlping .
 No dependencies beyond `gopkg.in/yaml.v3`. Everything else is the standard
 library, which keeps the image at ~9 MB.
 
+## Repository layout
+
+One file per concern, in the order they are used rather than alphabetically.
+
+| Surface | File | What it holds |
+|---|---|---|
+| commands | `main.go` | flags, the subcommand table, `serve` and its signals |
+| | `init.go` | the config and key a host starts with, and its checklist |
+| | `site.go` | `site add`, `site list`, `site rm`, and the atomic config edit |
+| | `doctor.go` | the read-only deployment checks, one line per fact |
+| HTTP | `server.go` | the mux, the three handlers, reload, and the refusals |
+| | `keys.go` | the per-host key verdict, and the recheck that moves it |
+| | `metrics.go` | the counters, and the Prometheus text they render as |
+| engine | `indexnow.go` | the POST, the key-file fetch, the URL scope rules |
+| | `config.go` | the YAML shape, its defaults, and the checks that refuse one |
+| limits | `ratelimit.go` | the per-host bucket behind an early `429` |
+| | `inflight.go` | the semaphores that bound concurrent engine work |
+| | `window.go` | the five-minute table that remembers what was just sent |
+
+Each file above has a `_test.go` beside it. Two do not test a file:
+`docs_test.go` checks the endpoint table above against the routes that serve it,
+in both directions, and `changelog_test.go` checks `CHANGELOG.md` against what
+the release script reads. `scripts/compose-smoke.sh` is the only test that sees
+the assembled container, and it exists for the failure the unit tests cannot
+reach - a container that builds, starts, and is unreachable from the host.
+
 ## Releasing
 
 Tag-driven, and the tag is the only trigger: `git tag v0.2.1 && git push origin
