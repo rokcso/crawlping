@@ -33,13 +33,13 @@ curl -s http://127.0.0.1:8080/health
 ```
 
 Two things are left, and they are yours to do: serve the `<key>.txt` that step 1
-wrote from the site (at `https://example.com/<key>.txt`), and call `/submit` from
+wrote from the site, at `https://example.com/<key>.txt`, and call `/submit` from
 your Worker with the bearer token that is now in `config.yaml`.
 
 Everything below is one of those steps in more detail. The flags in the commands
-above are load-bearing - [`Why the flags are what they are`](#why-the-flags-are-what-they-are)
-explains each one, and skipping that section is how this deployment breaks
-quietly.
+above are load-bearing, and skipping the section on why they are is how this
+deployment breaks quietly - see [Why the flags are what they
+are](#why-the-flags-are-what-they-are).
 
 ## Why not just use Cloudflare Crawler Hints?
 
