@@ -173,6 +173,18 @@ jobs:
           (cd dist && sha256sum ./* > checksums.txt)
           ls -l dist
 
+      # The assembly check has to run on the release path, not only on a pull
+      # request. It lives in the `test` job, and that job cannot run here: it is
+      # gated on `github.event_name != 'push'`, and a tag push is the one trigger
+      # that publishes. So the guard was absent from exactly the path it guards -
+      # and a release shipped with a container that could not read the config it
+      # was handed. This script catches that in under a minute.
+      #
+      # Before anything is pushed on purpose: a tag whose assembly is broken must
+      # fail while there is still nothing on GHCR to take back.
+      - name: Smoke test the default deployment path
+        run: sh scripts/compose-smoke.sh
+
       # No longer required for the compile: the Dockerfile builds on
       # $BUILDPLATFORM and cross-compiles, so Go never runs under emulation.
       # Kept as insurance for the final stage and for any future non-native
